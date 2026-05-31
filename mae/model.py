@@ -32,6 +32,9 @@ class Net(nn.Module):
     Masked Autoencoder (MAE) with a Vision Transformer (ViT) encoder-decoder architecture.
 
     Args:
+        n_encoder_blocks (int): Number of encoder transformer blocks.
+        n_decoder_blocks (int): Number of decoder transformer blocks.
+        patch_size (int): Side length of each square patch in pixels.
         D_image (int): Spatial dimension of the input image (assumes square, so H = W = D_image).
         patch_size (int): Side length of each square patch in pixels.
         D_patch (int): Dimensionality of each patch embedding (n_channels * patch_size^2).
@@ -51,6 +54,8 @@ class Net(nn.Module):
     """
     def __init__(
         self,
+        n_encoder_blocks,
+        n_decoder_blocks,
         D_image,
         patch_size,
         D_patch,
@@ -82,59 +87,31 @@ class Net(nn.Module):
 
 
         ### ENCODER
-
         self.img2enc_projection = nn.Linear(D_patch, D)
-
-        # Block 1
-        self.norm1a = nn.LayerNorm(D)
-        self.msa1 = nn.MultiheadAttention(D, n_heads, batch_first=True)
-        self.norm1b = nn.LayerNorm(D)
-        self.mlp1a = nn.Linear(D, D_mlp)
-        self.mlp1b = nn.Linear(D_mlp, D)
-
-        # Block 2
-        self.norm2a = nn.LayerNorm(D)
-        self.msa2 = nn.MultiheadAttention(D, n_heads, batch_first=True)
-        self.norm2b = nn.LayerNorm(D)
-        self.mlp2a = nn.Linear(D, D_mlp)
-        self.mlp2b = nn.Linear(D_mlp, D)
-
-        # Block 3
-        self.norm3a = nn.LayerNorm(D)
-        self.msa3 = nn.MultiheadAttention(D, n_heads, batch_first=True)
-        self.norm3b = nn.LayerNorm(D)
-        self.mlp3a = nn.Linear(D, D_mlp)
-        self.mlp3b = nn.Linear(D_mlp, D)
-
-        # Block 4
-        self.norm4a = nn.LayerNorm(D)
-        self.msa4 = nn.MultiheadAttention(D, n_heads, batch_first=True)
-        self.norm4b = nn.LayerNorm(D)
-        self.mlp4a = nn.Linear(D, D_mlp)
-        self.mlp4b = nn.Linear(D_mlp, D)
-
-        # Block 5
-        self.norm5a = nn.LayerNorm(D)
-        self.msa5 = nn.MultiheadAttention(D, n_heads, batch_first=True)
-        self.norm5b = nn.LayerNorm(D)
-        self.mlp5a = nn.Linear(D, D_mlp)
-        self.mlp5b = nn.Linear(D_mlp, D)
-
-        # Block 6
-        self.norm6a = nn.LayerNorm(D)
-        self.msa6 = nn.MultiheadAttention(D, n_heads, batch_first=True)
-        self.norm6b = nn.LayerNorm(D)
-        self.mlp6a = nn.Linear(D, D_mlp)
-        self.mlp6b = nn.Linear(D_mlp, D)
+        self.encoder_blocks = nn.ModuleList([
+            nn.ModuleDict({
+                'norm_a' : nn.LayerNorm(D),
+                'msa' : nn.MultiheadAttention(D, n_heads, batch_first=True),
+                'norm_b': nn.LayerNorm(D),
+                'mlp_a': nn.Linear(D, D_mlp),
+                'mlp_b': nn.Linear(D_mlp, D)
+            })
+            for _ in range(n_encoder_blocks)
+        ])
 
         ### DECODER (just single transformer block)
         self.masked_embedding = nn.Parameter(torch.randn(1, 1, D_decoder))
         self.enc2dec_projection = nn.Linear(D, D_decoder)
-        self.decoder_norm1 = nn.LayerNorm(D_decoder)
-        self.decoder_msa = nn.MultiheadAttention(D_decoder, n_heads, batch_first=True)
-        self.decoder_norm2 = nn.LayerNorm(D_decoder)
-        self.decoder_mlp1 = nn.Linear(D_decoder, D_decoder_mlp)
-        self.decoder_mlp2 = nn.Linear(D_decoder_mlp, D_decoder)
+        self.decoder_blocks = nn.ModuleList([
+            nn.ModuleDict({
+                'norm_a' : nn.LayerNorm(D_decoder),
+                'msa' : nn.MultiheadAttention(D_decoder, n_heads, batch_first=True),
+                'norm_b': nn.LayerNorm(D_decoder),
+                'mlp_a': nn.Linear(D_decoder, D_decoder_mlp),
+                'mlp_b': nn.Linear(D_decoder_mlp, D_decoder)
+            })
+            for _ in range(n_decoder_blocks)
+        ])
         self.dec2img_projection = nn.Linear(D_decoder, D_patch)
 
     def encode(self, x):
@@ -178,54 +155,15 @@ class Net(nn.Module):
         local_pos_embeddings = torch.gather(self.pos_embeddings_enc.unsqueeze(0).expand(B, -1, -1), 1, ind_unmasked_pos)
         embeddings = embeddings + local_pos_embeddings
 
-        # Block 1
-        x = self.norm1a(embeddings)
-        x, _ = self.msa1(x, x, x)
-        embeddings = embeddings + x # skip connection
-        x = self.norm1b(embeddings)
-        x = F.gelu( self.mlp1a(x) )
-        x = self.mlp1b(x)
-        embeddings = embeddings + x # skip connection
-        # Block 2
-        x = self.norm2a(embeddings)
-        x, _ = self.msa2(x, x, x)
-        embeddings = embeddings + x # skip connection
-        x = self.norm2b(embeddings)
-        x = F.gelu( self.mlp2a(x) )
-        x = self.mlp2b(x)
-        embeddings = embeddings + x # skip connection
-        # Block 3
-        x = self.norm3a(embeddings)
-        x, _ = self.msa3(x, x, x)
-        embeddings = embeddings + x # skip connection
-        x = self.norm3b(embeddings)
-        x = F.gelu( self.mlp3a(x) )
-        x = self.mlp3b(x)
-        embeddings = embeddings + x # skip connection
-        # Block 4
-        x = self.norm4a(embeddings)
-        x, _ = self.msa4(x, x, x)
-        embeddings = embeddings + x # skip connection
-        x = self.norm4b(embeddings)
-        x = F.gelu( self.mlp4a(x) )
-        x = self.mlp4b(x)
-        embeddings = embeddings + x # skip connection
-        # Block 5
-        x = self.norm5a(embeddings)
-        x, _ = self.msa5(x, x, x)
-        embeddings = embeddings + x # skip connection
-        x = self.norm5b(embeddings)
-        x = F.gelu( self.mlp5a(x) )
-        x = self.mlp5b(x)
-        embeddings = embeddings + x # skip connection
-        # Block 6
-        x = self.norm6a(embeddings)
-        x, _ = self.msa6(x, x, x)
-        embeddings = embeddings + x # skip connection
-        x = self.norm6b(embeddings)
-        x = F.gelu( self.mlp6a(x) )
-        x = self.mlp6b(x)
-        embeddings = embeddings + x # skip connection
+        # Run through all Encoder Blocks
+        for block in self.encoder_blocks:
+            x = block['norm_a'](embeddings)
+            x, _ = block['msa'](x, x, x)
+            embeddings = embeddings + x # skip connection
+            x = block['norm_b'](embeddings)
+            x = F.gelu( block['mlp_a'](x) )
+            x = block['mlp_b'](x)
+            embeddings = embeddings + x # skip connection
 
         return embeddings, truth_patches, ids_unmasked, ids_masked
 
@@ -244,13 +182,16 @@ class Net(nn.Module):
         embeddings_dec = x.clone().scatter(1, ind_unmasked_dec, unmasked_embeddings_dec)
         # embeddings_dec = torch.scatter(x, 1, ind_unmasked_dec, unmasked_embeddings_dec)
         embeddings_dec = embeddings_dec + self.pos_embeddings_dec # broadcast along B in pos_embeddings
-        x = self.decoder_norm1(embeddings_dec)
-        x, _ = self.decoder_msa(x, x, x)
-        embeddings_dec = embeddings_dec + x
-        x = self.decoder_norm2(embeddings_dec)
-        x = F.gelu( self.decoder_mlp1(x) )
-        x = self.decoder_mlp2(x)
-        embeddings_dec = embeddings_dec + x
+
+        for block in self.decoder_blocks:
+            x = block['norm_a'](embeddings_dec)
+            x, _ = block['msa'](x, x, x)
+            embeddings_dec = embeddings_dec + x
+            x = block['norm_b'](embeddings_dec)
+            x = F.gelu( block['mlp_a'](x) )
+            x = block['mlp_b'](x)
+            embeddings_dec = embeddings_dec + x
+
         y_patches = self.dec2img_projection(embeddings_dec)
 
         return y_patches, truth_patches, ids_masked
