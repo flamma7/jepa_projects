@@ -36,16 +36,17 @@ class Net(nn.Module):
         n_encoder_blocks (int): Number of encoder transformer blocks.
         n_decoder_blocks (int): Number of decoder transformer blocks.
         patch_size (int): Side length of each square patch in pixels.
-        D_image (int): Spatial dimension of the input image (assumes square, so H = W = D_image).
+        d_image (int): Spatial dimension of the input image (assumes square, so H = W = d_image).
         patch_size (int): Side length of each square patch in pixels.
-        D_patch (int): Dimensionality of each patch embedding (n_channels * patch_size^2).
+        d_patch (int): Dimensionality of each patch embedding (n_channels * patch_size^2).
         n_patches (int): Total number of patches per image.
         n_rows (int): Number of patch rows in the image grid.
-        D (int): Hidden embedding dimension of the encoder.
-        D_mlp (int): Hidden dimension of the MLP blocks in the encoder.
-        D_decoder (int): Hidden embedding dimension of the decoder.
-        D_decoder_mlp (int): Hidden dimension of the MLP blocks in the decoder.
-        n_heads (int): Number of attention heads per transformer block.
+        d_enc (int): Hidden embedding dimension of the encoder.
+        d_enc_mlp (int): Hidden dimension of the MLP blocks in the encoder.
+        d_dec (int): Hidden embedding dimension of the decoder.
+        d_dec_mlp (int): Hidden dimension of the MLP blocks in the decoder.
+        n_heads_enc (int): Number of attention heads per encoder transformer block.
+        n_heads_dec (int): Number of attention heads per decoder transformer block.
         pos_embeddings_enc (torch.Tensor): Positional embeddings for the encoder,
             shape ``(1, n_patches, D)``.
         pos_embedding_dec (torch.Tensor): Positional embeddings for the decoder,
@@ -57,63 +58,64 @@ class Net(nn.Module):
         self,
         n_encoder_blocks,
         n_decoder_blocks,
-        D_image,
+        d_image,
         patch_size,
-        D_patch,
+        d_patch,
         n_patches,
         n_rows,
-        D,
-        D_mlp,
-        D_decoder,
-        D_decoder_mlp,
-        n_heads,
+        d_enc,
+        d_enc_mlp,
+        d_dec,
+        d_dec_mlp,
+        n_heads_enc,
+        n_heads_dec,
         pos_embeddings_enc,
         pos_embedding_dec,
         percent_unmasked,
     ):
         super(Net, self).__init__()
 
-        self.D_image = D_image
+        self.d_image = d_image
         self.patch_size = patch_size
-        self.D_patch = D_patch
+        self.d_patch = d_patch
         self.n_patches = n_patches
         self.n_rows = n_rows
-        self.D = D
-        self.D_mlp = D_mlp
-        self.D_decoder = D_decoder
-        self.D_decoder_mlp = D_decoder_mlp
+        self.d_enc = d_enc
+        self.d_enc_mlp = d_enc_mlp
+        self.d_dec = d_dec
+        self.d_dec_mlp = d_dec_mlp
         self.pos_embeddings_enc = pos_embeddings_enc
         self.pos_embeddings_dec = pos_embedding_dec
         self.percent_unmasked = percent_unmasked
 
 
         ### ENCODER
-        self.img2enc_projection = nn.Linear(D_patch, D)
+        self.img2enc_projection = nn.Linear(d_patch, d_enc)
         self.encoder_blocks = nn.ModuleList([
             nn.ModuleDict({
-                'norm_a' : nn.LayerNorm(D),
-                'msa' : nn.MultiheadAttention(D, n_heads, batch_first=True),
-                'norm_b': nn.LayerNorm(D),
-                'mlp_a': nn.Linear(D, D_mlp),
-                'mlp_b': nn.Linear(D_mlp, D)
+                'norm_a' : nn.LayerNorm(d_enc),
+                'msa' : nn.MultiheadAttention(d_enc, n_heads_enc, batch_first=True),
+                'norm_b': nn.LayerNorm(d_enc),
+                'mlp_a': nn.Linear(d_enc, d_enc_mlp),
+                'mlp_b': nn.Linear(d_enc_mlp, d_enc)
             })
             for _ in range(n_encoder_blocks)
         ])
 
         ### DECODER (just single transformer block)
-        self.masked_embedding = nn.Parameter(torch.randn(1, 1, D_decoder))
-        self.enc2dec_projection = nn.Linear(D, D_decoder)
+        self.masked_embedding = nn.Parameter(torch.randn(1, 1, d_dec))
+        self.enc2dec_projection = nn.Linear(d_enc, d_dec)
         self.decoder_blocks = nn.ModuleList([
             nn.ModuleDict({
-                'norm_a' : nn.LayerNorm(D_decoder),
-                'msa' : nn.MultiheadAttention(D_decoder, n_heads, batch_first=True),
-                'norm_b': nn.LayerNorm(D_decoder),
-                'mlp_a': nn.Linear(D_decoder, D_decoder_mlp),
-                'mlp_b': nn.Linear(D_decoder_mlp, D_decoder)
+                'norm_a' : nn.LayerNorm(d_dec),
+                'msa' : nn.MultiheadAttention(d_dec, n_heads_dec, batch_first=True),
+                'norm_b': nn.LayerNorm(d_dec),
+                'mlp_a': nn.Linear(d_dec, d_dec_mlp),
+                'mlp_b': nn.Linear(d_dec_mlp, d_dec)
             })
             for _ in range(n_decoder_blocks)
         ])
-        self.dec2img_projection = nn.Linear(D_decoder, D_patch)
+        self.dec2img_projection = nn.Linear(d_dec, d_patch)
 
     def encode(self, x):
         # x is (B, C, H, W) = (B, 3, 96, 96)
@@ -129,7 +131,7 @@ class Net(nn.Module):
 
         SEQ = self.n_patches # N_ROWS ** 2
 
-        x = x.view(B, SEQ, self.D_patch)
+        x = x.view(B, SEQ, self.d_patch)
         # assert x.shape == (B, 144, 192), x.shape
         truth_patches = x
 
@@ -141,7 +143,7 @@ class Net(nn.Module):
         ids_masked = ids_shuffle[:, n_keep:] # Store the ids of last 75% -> (B, n_masked)
 
         # x_unmasked we want (B, n_keep, 192)
-        ind_unmasked_enc = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.D_patch) # (B, n_keep, D_patch)
+        ind_unmasked_enc = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.d_patch) # (B, n_keep, d_patch)
         
         # For dim=1, keep all dimensions the same but replaces with the column index
         x_unmasked = torch.gather(x, 1, ind_unmasked_enc)
@@ -152,7 +154,7 @@ class Net(nn.Module):
         # Add our positional embeddings
         # (N_PATCHES, D)
         # embeddings is (B, n_keep, D)
-        ind_unmasked_pos = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.D)
+        ind_unmasked_pos = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.d_enc)
         local_pos_embeddings = torch.gather(self.pos_embeddings_enc.unsqueeze(0).expand(B, -1, -1), 1, ind_unmasked_pos)
         embeddings = embeddings + local_pos_embeddings
 
@@ -174,7 +176,7 @@ class Net(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         embeddings, truth_patches, ids_unmasked, ids_masked = self.encode(x)
-        ind_unmasked_dec = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.D_decoder) # (B, n_keep, D)
+        ind_unmasked_dec = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.d_dec) # (B, n_keep, D)
 
         ## DECODER
         x = self.masked_embedding.repeat(B, self.n_patches, 1)
@@ -222,7 +224,7 @@ class NetCheckpoint(Net):
 
         SEQ = self.n_patches # N_ROWS ** 2
 
-        x = x.view(B, SEQ, self.D_patch)
+        x = x.view(B, SEQ, self.d_patch)
         # assert x.shape == (B, 144, 192), x.shape
         truth_patches = x
 
@@ -234,7 +236,7 @@ class NetCheckpoint(Net):
         ids_masked = ids_shuffle[:, n_keep:] # Store the ids of last 75% -> (B, n_masked)
 
         # x_unmasked we want (B, n_keep, 192)
-        ind_unmasked_enc = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.D_patch) # (B, n_keep, D_patch)
+        ind_unmasked_enc = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.d_patch) # (B, n_keep, d_patch)
         
         # For dim=1, keep all dimensions the same but replaces with the column index
         x_unmasked = torch.gather(x, 1, ind_unmasked_enc)
@@ -259,6 +261,7 @@ class NetCheckpoint(Net):
                 x = F.gelu(b['mlp_a'](x))
                 x = b['mlp_b'](x)
                 return emb + x
+            # embeddings = block_fn(embeddings) # no checkpointing
             embeddings = checkpoint(block_fn, embeddings, use_reentrant=False)
 
         return embeddings, truth_patches, ids_unmasked, ids_masked
@@ -285,6 +288,7 @@ class NetCheckpoint(Net):
                 x = F.gelu(b['mlp_a'](x))
                 x = b['mlp_b'](x)
                 return emb + x
+            # embeddings_dec = block_fn(embeddings_dec) # no checkpoints
             embeddings_dec = checkpoint(block_fn, embeddings_dec, use_reentrant=False)
 
         y_patches = self.dec2img_projection(embeddings_dec)
