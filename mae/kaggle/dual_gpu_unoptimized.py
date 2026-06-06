@@ -1,0 +1,512 @@
+"""
+This program works for training across two Kaggle GPUs using PyTorch's DataParallel class
+It relies on loading the STL-10 (binary files) dataset
+Training Loss was observed to be decreasing well but each epoch was taking around 8min
+"""
+
+import torch
+from torch import nn, optim
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+
+
+
+print(torch.cuda.is_available())
+torch.cuda.device_count()
+
+
+
+device = torch.device('cuda:0')
+
+
+
+# Configurations
+cfg = {
+    "data": {
+        "d_image": 96,
+        "n_channels": 3,
+        "patch_size": 8,
+    },
+    "model": {
+        "d_enc": 384,
+        "n_heads_enc": 6,
+        "n_encoder_blocks": 12,
+        "mlp_ratio": 4,
+        "d_dec": 384,
+        "n_heads_dec": 6,
+        "n_decoder_blocks": 12,
+    },
+    "metadata": {
+        "world_size" : 2,
+        "lr": 1.5e-4,
+        "batch_size": 4096,
+        "weight_decay": 0.05,
+        "momentum": [0.9, 0.95],
+        "warmup_epochs": 40,
+        "n_epochs": 1600,
+        "percent_unmasked": 0.25,
+        "use_autocast": False,
+        "use_grad_accumulation": True,
+        "micro_batch_size" : 196,
+        "use_grad_checkpoint": False,
+        "load_model": False,
+        "r_model_path": "",
+    },
+}
+
+
+
+# --- Base params (from config) ---
+# Image
+D_IMAGE    = cfg["data"]["d_image"]
+N_CHANNELS = cfg["data"]["n_channels"]
+PATCH_SIZE = cfg["data"]["patch_size"]
+# Encoder
+D_ENC            = cfg["model"]["d_enc"]
+N_HEADS_ENC      = cfg["model"]["n_heads_enc"]
+N_ENCODER_BLOCKS = cfg["model"]["n_encoder_blocks"]
+MLP_RATIO        = cfg["model"]["mlp_ratio"]
+# Decoder
+D_DEC            = cfg["model"]["d_dec"]
+N_HEADS_DEC      = cfg["model"]["n_heads_dec"]
+N_DECODER_BLOCKS = cfg["model"]["n_decoder_blocks"]
+# Training
+WORLD_SIZE            = cfg["metadata"]["world_size"]
+LR                    = cfg["metadata"]["lr"]
+BATCH_SIZE            = cfg["metadata"]["batch_size"]
+WEIGHT_DECAY          = cfg["metadata"]["weight_decay"]
+MOMENTUM              = cfg["metadata"]["momentum"]            # [0.9, 0.95]
+WARMUP_EPOCHS         = cfg["metadata"]["warmup_epochs"]
+N_EPOCHS              = cfg["metadata"]["n_epochs"]
+PERCENT_UNMASKED      = cfg["metadata"]["percent_unmasked"]
+USE_AUTOCAST          = cfg["metadata"]["use_autocast"]
+USE_GRAD_ACCUMULATION = cfg["metadata"]["use_grad_accumulation"]
+MICRO_BATCH_SIZE      = cfg["metadata"]["micro_batch_size"]
+USE_GRAD_CHECKPOINT   = cfg["metadata"]["use_grad_checkpoint"]
+LOAD_MODEL            = cfg["metadata"]["load_model"]
+R_MODEL_PATH          = cfg["metadata"]["r_model_path"]
+# --- Derived params (computed) ---
+D_PATCH   = (PATCH_SIZE ** 2) * N_CHANNELS 
+N_PATCHES = (D_IMAGE ** 2) // (PATCH_SIZE ** 2)
+N_ROWS    = D_IMAGE // PATCH_SIZE
+D_ENC_MLP = int(MLP_RATIO * D_ENC)
+D_DEC_MLP = int(MLP_RATIO * D_DEC)
+
+
+
+# Transforms
+train_transform = transforms.Compose([
+    transforms.RandomResizedCrop(D_IMAGE, scale=(0.5, 1.0)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4467, 0.4398, 0.4066), (0.2604, 0.2566, 0.2713))
+])
+test_transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.4467, 0.4398, 0.4066), (0.2604, 0.2566, 0.2713))
+])
+
+
+# Load datasets
+supervised_trainset = torchvision.datasets.STL10(
+    root='/kaggle/input/datasets/pratt3000/stl10-binary-files/', split='train', download=False, transform=train_transform
+)
+testset = torchvision.datasets.STL10(
+    root='/kaggle/input/datasets/pratt3000/stl10-binary-files/', split='test', download=False, transform=test_transform
+)
+unlabeled_set = torchvision.datasets.STL10(
+    root='/kaggle/input/datasets/pratt3000/stl10-binary-files/', split='unlabeled', download=False, transform=train_transform
+)
+
+
+# DataLoaders
+micro_batch_size = MICRO_BATCH_SIZE if USE_GRAD_ACCUMULATION else BATCH_SIZE
+if WORLD_SIZE > 1:
+    micro_batch_size *= WORLD_SIZE
+supervised_trainloader = torch.utils.data.DataLoader(
+    supervised_trainset, batch_size=micro_batch_size, shuffle=True, num_workers=2
+)
+testloader = torch.utils.data.DataLoader(
+    testset, batch_size=micro_batch_size, shuffle=False, num_workers=2
+)
+ssl_trainloader = torch.utils.data.DataLoader(
+    unlabeled_set, batch_size=micro_batch_size, shuffle=True, num_workers=2, drop_last=True
+)
+
+
+def get_pos_embeddings(D, n_patches, n_rows):
+    D_pos = D // 2 # 96
+    row_pos = np.zeros((n_rows, D_pos))
+    col_pos = np.zeros((n_rows, D_pos))
+
+    i = np.arange(D_pos // 2) # half sine, half cosine
+    denominators = 10000 ** (2 * i / D_pos)
+
+    for row in range(0, n_rows):
+        row_pos[row, 0::2] = np.sin(row / denominators) # even inddicies
+        row_pos[row, 1::2] = np.cos(row / denominators) # odd indicies
+
+    for col in range(0, n_rows):
+        col_pos[col, 0::2] = np.sin(col / denominators) # even inddicies
+        col_pos[col, 1::2] = np.cos(col / denominators) # odd indicies
+
+    pos_embeddings = np.zeros((n_patches, D))
+    for row in range(0, n_rows):
+        for col in range(0, n_rows):
+            pos_embeddings[row*n_rows + col, :] = np.concatenate([row_pos[row, :], col_pos[col, :]])
+    pos_embeddings = torch.tensor(pos_embeddings, dtype=torch.float32)
+    return pos_embeddings
+
+
+pos_embeddings_enc = get_pos_embeddings(D_ENC, N_PATCHES, N_ROWS)
+pos_embeddings_dec = get_pos_embeddings(D_DEC, N_PATCHES, N_ROWS)
+
+
+class Net(nn.Module):
+    """
+    Masked Autoencoder (MAE) with a Vision Transformer (ViT) encoder-decoder architecture.
+
+    Args:
+        n_encoder_blocks (int): Number of encoder transformer blocks.
+        n_decoder_blocks (int): Number of decoder transformer blocks.
+        patch_size (int): Side length of each square patch in pixels.
+        d_image (int): Spatial dimension of the input image (assumes square, so H = W = d_image).
+        patch_size (int): Side length of each square patch in pixels.
+        d_patch (int): Dimensionality of each patch embedding (n_channels * patch_size^2).
+        n_patches (int): Total number of patches per image.
+        n_rows (int): Number of patch rows in the image grid.
+        d_enc (int): Hidden embedding dimension of the encoder.
+        d_enc_mlp (int): Hidden dimension of the MLP blocks in the encoder.
+        d_dec (int): Hidden embedding dimension of the decoder.
+        d_dec_mlp (int): Hidden dimension of the MLP blocks in the decoder.
+        n_heads_enc (int): Number of attention heads per encoder transformer block.
+        n_heads_dec (int): Number of attention heads per decoder transformer block.
+        pos_embeddings_enc (torch.Tensor): Positional embeddings for the encoder,
+            shape ``(1, n_patches, D)``.
+        pos_embedding_dec (torch.Tensor): Positional embeddings for the decoder,
+            shape ``(1, n_patches, D_decoder)``.
+        percent_unmasked (float): Fraction of patch embeddings visible to the encoder,
+            in the range ``(0, 1]``.
+    """
+    def __init__(
+        self,
+        n_encoder_blocks,
+        n_decoder_blocks,
+        d_image,
+        patch_size,
+        d_patch,
+        n_patches,
+        n_rows,
+        d_enc,
+        d_enc_mlp,
+        d_dec,
+        d_dec_mlp,
+        n_heads_enc,
+        n_heads_dec,
+        pos_embeddings_enc,
+        pos_embeddings_dec,
+        percent_unmasked,
+    ):
+        super(Net, self).__init__()
+
+        self.d_image = d_image
+        self.patch_size = patch_size
+        self.d_patch = d_patch
+        self.n_patches = n_patches
+        self.n_rows = n_rows
+        self.d_enc = d_enc
+        self.d_enc_mlp = d_enc_mlp
+        self.d_dec = d_dec
+        self.d_dec_mlp = d_dec_mlp
+        self.register_buffer("pos_embeddings_enc", pos_embeddings_enc)
+        self.register_buffer("pos_embeddings_dec", pos_embeddings_dec)
+        self.percent_unmasked = percent_unmasked
+
+        ### ENCODER
+        self.img2enc_projection = nn.Linear(d_patch, d_enc)
+        self.encoder_blocks = nn.ModuleList([
+            nn.ModuleDict({
+                'norm_a' : nn.LayerNorm(d_enc),
+                'msa' : nn.MultiheadAttention(d_enc, n_heads_enc, batch_first=True),
+                'norm_b': nn.LayerNorm(d_enc),
+                'mlp_a': nn.Linear(d_enc, d_enc_mlp),
+                'mlp_b': nn.Linear(d_enc_mlp, d_enc)
+            })
+            for _ in range(n_encoder_blocks)
+        ])
+
+        ### DECODER (just single transformer block)
+        self.masked_embedding = nn.Parameter(torch.randn(1, 1, d_dec))
+        self.enc2dec_projection = nn.Linear(d_enc, d_dec)
+        self.decoder_blocks = nn.ModuleList([
+            nn.ModuleDict({
+                'norm_a' : nn.LayerNorm(d_dec),
+                'msa' : nn.MultiheadAttention(d_dec, n_heads_dec, batch_first=True),
+                'norm_b': nn.LayerNorm(d_dec),
+                'mlp_a': nn.Linear(d_dec, d_dec_mlp),
+                'mlp_b': nn.Linear(d_dec_mlp, d_dec)
+            })
+            for _ in range(n_decoder_blocks)
+        ])
+        self.dec2img_projection = nn.Linear(d_dec, d_patch)
+
+    def encode(self, x):
+        # x is (B, C, H, W) = (B, 3, 96, 96)
+        B, C, H, W = x.shape
+
+        # Make (B, 3, 12, 12, 8, 8)
+        patches = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+        # assert patches.shape == (B, C, self.n_rows, self.n_rows, self.patch_size, self.patch_size), patches.shape 
+        
+        # Make (B, 12, 12, 3, 8, 8)
+        x = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
+        # assert x.shape == (B, self.n_rows, self.n_rows, C, self.patch_size, self.patch_size), x.shape
+
+        SEQ = self.n_patches # N_ROWS ** 2
+
+        x = x.view(B, SEQ, self.d_patch)
+        # assert x.shape == (B, 144, 192), x.shape
+        truth_patches = x
+
+        # Create a mask and apply it
+        noise = torch.rand(B, SEQ, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1) # Get a list of sorted ids for each B
+        n_keep = int(SEQ * self.percent_unmasked)
+        ids_unmasked = ids_shuffle[:, :n_keep] # Store the ids of first 25% -> (B, n_keep)
+        ids_masked = ids_shuffle[:, n_keep:] # Store the ids of last 75% -> (B, n_masked)
+
+        # x_unmasked we want (B, n_keep, 192)
+        ind_unmasked_enc = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.d_patch) # (B, n_keep, d_patch)
+        
+        # For dim=1, keep all dimensions the same but replaces with the column index
+        x_unmasked = torch.gather(x, 1, ind_unmasked_enc)
+        # assert x_unmasked.shape == (B, n_keep, 192), x_unmasked.shape
+
+        embeddings = self.img2enc_projection(x_unmasked)
+
+        # Add our positional embeddings
+        # (N_PATCHES, D)
+        # embeddings is (B, n_keep, D)
+        ind_unmasked_pos = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.d_enc)
+        local_pos_embeddings = torch.gather(self.pos_embeddings_enc.unsqueeze(0).expand(B, -1, -1), 1, ind_unmasked_pos)
+        embeddings = embeddings + local_pos_embeddings
+
+        # Run through all Encoder Blocks
+        for block in self.encoder_blocks:
+            x = block['norm_a'](embeddings)
+            x, _ = block['msa'](x, x, x)
+            embeddings = embeddings + x # skip connection
+            x = block['norm_b'](embeddings)
+            x = F.gelu( block['mlp_a'](x) )
+            x = block['mlp_b'](x)
+            embeddings = embeddings + x # skip connection
+
+        return embeddings, truth_patches, ids_unmasked, ids_masked
+
+        # Ok now we need to return the meal across the embeddings
+        # return embeddings.mean(dim=1) # (B, D)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        embeddings, truth_patches, ids_unmasked, ids_masked = self.encode(x)
+        ind_unmasked_dec = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.d_dec) # (B, n_keep, D)
+
+        ## DECODER
+        x = self.masked_embedding.repeat(B, self.n_patches, 1)
+        # assert x.shape == (B, self.n_patches, self.D_decoder), x.shape
+        unmasked_embeddings_dec = self.enc2dec_projection(embeddings).to(x.dtype) # cast to support autocast fp16
+        embeddings_dec = x.clone().scatter(1, ind_unmasked_dec, unmasked_embeddings_dec)
+        # embeddings_dec = torch.scatter(x, 1, ind_unmasked_dec, unmasked_embeddings_dec)
+        embeddings_dec = embeddings_dec + self.pos_embeddings_dec # broadcast along B in pos_embeddings
+
+        for block in self.decoder_blocks:
+            x = block['norm_a'](embeddings_dec)
+            x, _ = block['msa'](x, x, x)
+            embeddings_dec = embeddings_dec + x
+            x = block['norm_b'](embeddings_dec)
+            x = F.gelu( block['mlp_a'](x) )
+            x = block['mlp_b'](x)
+            embeddings_dec = embeddings_dec + x
+
+        y_patches = self.dec2img_projection(embeddings_dec)
+
+        return y_patches, truth_patches, ids_masked
+    
+
+
+net = Net(
+    n_encoder_blocks=N_ENCODER_BLOCKS,
+    n_decoder_blocks=N_DECODER_BLOCKS,
+    d_image=D_IMAGE,
+    patch_size=PATCH_SIZE,
+    d_patch=D_PATCH,
+    n_patches=N_PATCHES,
+    n_rows=N_ROWS,
+    d_enc=D_ENC,
+    d_enc_mlp=D_ENC_MLP,
+    d_dec=D_DEC,
+    d_dec_mlp=D_DEC_MLP,
+    n_heads_enc=N_HEADS_ENC,
+    n_heads_dec=N_HEADS_DEC,
+    pos_embeddings_enc=pos_embeddings_enc,
+    pos_embeddings_dec=pos_embeddings_dec,
+    percent_unmasked=PERCENT_UNMASKED)
+net.to(device)
+
+
+
+import os, sys, io, tarfile, logging
+
+# --- Output locations (on Kaggle, /kaggle/working is downloadable) ---
+OUTPUT_DIR = '/kaggle/working'
+CHECKPOINT_DIR = f'{OUTPUT_DIR}/checkpoints'
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+CHECKPOINT_EVERY = 50   # epochs between compressed checkpoints
+PLOT_EVERY       = 10   # epochs between loss-curve refreshes
+
+# --- Logger with timestamps (configured so it actually prints inside Jupyter) ---
+logger = logging.getLogger('mae_train')
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+_h = logging.StreamHandler(sys.stdout)
+_h.setFormatter(logging.Formatter('%(asctime)s | %(message)s', datefmt='%H:%M:%S'))
+logger.addHandler(_h)
+logger.propagate = False
+
+# --- Checkpoint helpers ---
+def save_checkpoint(state, path):
+    """Uncompressed save (fast). Used for the always-overwritten 'latest'."""
+    torch.save(state, path)
+    return path
+
+def save_compressed_checkpoint(state, path):
+    """Save then gzip-tar it; removes the .pt and returns the .tar.gz path."""
+    torch.save(state, path)
+    tar_path = path + '.tar.gz'
+    with tarfile.open(tar_path, 'w:gz') as tar:
+        tar.add(path, arcname=os.path.basename(path))
+    os.remove(path)
+    return tar_path
+
+def load_compressed_checkpoint(tar_path, map_location=None):
+    """Load a checkpoint written by save_compressed_checkpoint."""
+    with tarfile.open(tar_path, 'r:gz') as tar:
+        member = tar.getmembers()[0]
+        buffer = io.BytesIO(tar.extractfile(member).read())
+    # weights_only=False because this is your own trusted file and it holds
+    # optimizer/scheduler state; torch>=2.6 defaults to True and would choke on it.
+    return torch.load(buffer, map_location=map_location, weights_only=False)
+    
+
+
+_test_state = {'epoch': 0, 'model_state_dict': net.state_dict(), 'loss': 0.0}
+_tar = save_compressed_checkpoint(_test_state, f'{CHECKPOINT_DIR}/_test.pt')
+print('Wrote:', _tar, f'({os.path.getsize(_tar) / 1e6:.1f} MB)')
+_loaded = load_compressed_checkpoint(_tar, map_location='cpu')
+print('Round-trip OK - keys:', list(_loaded.keys()), '| epoch:', _loaded['epoch'])
+os.remove(_tar)
+
+
+net = nn.DataParallel(net)
+logger.info(f"Using DataParallel across {WORLD_SIZE} GPUs")
+
+
+
+criterion = nn.MSELoss()
+optimizer = optim.AdamW(
+    net.parameters(),
+    lr=LR,
+    betas=tuple(MOMENTUM),   # MOMENTUM is the [0.9, 0.95] list -> tuple
+    eps=1e-8,                # no config var for eps, kept as before
+    weight_decay=WEIGHT_DECAY,
+)
+
+warmup = LinearLR(optimizer, start_factor=1/WARMUP_EPOCHS, total_iters=WARMUP_EPOCHS)
+cosine = CosineAnnealingLR(optimizer, N_EPOCHS - WARMUP_EPOCHS)
+scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[WARMUP_EPOCHS])
+
+ACCUM_STEPS = BATCH_SIZE // (MICRO_BATCH_SIZE * WORLD_SIZE) if USE_GRAD_ACCUMULATION else 1
+
+train_losses = []
+for epoch in range(N_EPOCHS):
+    epoch_loss = 0.0
+    running_loss = 0.0
+    accum_count = 0
+    optimizer.zero_grad()
+    for i, data in enumerate(ssl_trainloader):
+        inputs = data[0].to(device)
+        y_pred_patches, y_true_patches, ids_masked = net(inputs)
+        masked_indices = ids_masked.unsqueeze(-1).expand(-1, -1, D_PATCH)
+        y_pred_masked_patches = torch.gather(y_pred_patches, 1, masked_indices)
+
+        with torch.no_grad():
+            y_true_patches = torch.gather(y_true_patches, 1, masked_indices)
+            # normalize each patch to zero mean, unit variance
+            mean = y_true_patches.mean(dim=-1, keepdim=True)
+            var = y_true_patches.var(dim=-1, keepdim=True)
+            y_true_patches = (y_true_patches - mean) / (var + 1e-6).sqrt()
+
+        loss = criterion(y_pred_masked_patches, y_true_patches)
+        (loss / ACCUM_STEPS).backward()
+        running_loss += loss.item()
+        accum_count += 1
+        if (i + 1) % ACCUM_STEPS == 0 or (i + 1) == len(ssl_trainloader):
+            logger.info(f"epoch {epoch}, index {i}, running_loss {running_loss / accum_count:.6f}")
+            optimizer.step()
+            optimizer.zero_grad()
+            running_loss = 0.0
+            accum_count = 0
+        epoch_loss += loss.item()
+
+    avg_loss = epoch_loss / len(ssl_trainloader)
+    train_losses.append(avg_loss)
+    scheduler.step()
+    logger.info(f'Epoch {epoch + 1}/{N_EPOCHS} - loss: {avg_loss:.6f}')
+
+    # always-overwritten 'latest' for crash recovery (uncompressed, fast)
+    model_sd = net.module.state_dict() if isinstance(net, nn.DataParallel) else net.state_dict()
+    save_checkpoint({
+        'epoch': epoch + 1,
+        'model_state_dict': model_sd,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'loss': avg_loss,
+    }, f'{CHECKPOINT_DIR}/latest.pt')
+
+    # refresh the downloadable loss curve
+    if (epoch + 1) % PLOT_EVERY == 0:
+        plt.figure(figsize=(14, 4))
+        plt.subplot(1, 2, 1)
+        plt.plot(train_losses)
+        plt.xlabel("Epoch"); plt.ylabel("MSE Loss")
+        plt.title("MAE Training Loss (Full)")
+        plt.yscale("log")
+        plt.subplot(1, 2, 2)
+        last_n = min(10, len(train_losses))
+        plt.plot(range(len(train_losses) - last_n, len(train_losses)), train_losses[-last_n:])
+        plt.xlabel("Epoch"); plt.ylabel("MSE Loss")
+        plt.title("MAE Training Loss (Last 10 Epochs)")
+        plt.tight_layout()
+        plt.savefig(f"{OUTPUT_DIR}/loss_curve.png")
+        plt.close()
+
+    # periodic compressed snapshot for history
+    if (epoch + 1) % CHECKPOINT_EVERY == 0:
+        tar_path = save_compressed_checkpoint({
+            'epoch': epoch + 1,
+            'model_state_dict': model_sd,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'loss': avg_loss,
+        }, f'{CHECKPOINT_DIR}/checkpoint_epoch_{epoch + 1}.pt')
+        logger.info(f'Checkpoint saved: {tar_path}')
+
+logger.info('Finished training')
+
+
