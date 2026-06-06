@@ -1,32 +1,48 @@
 """
-This is a version of the unoptimized dual GPU MAE training where I
-- added torch.autocast(dtype=torch.float16) -- bfloat16 is not avaiable on older T4's so I must use a gradient scalar
-- bumped micro_batch_size from 196 --> 512
-- removed unnecessary .item() calls in the training loop -- replaced with .detach() to not cause a CPU-GPU sync
-- only caused CPU-GPU sync for logging per-step and per-epoch logging
-- optimized data loading with pin_memory and num_workers
-- added torch.backends.cudnn.benchmark = True to optimize cuda kernels
+Version 2 optimiztions
+- using DistributedDataParallel
+- using torch.compile()
 
-Reduced epoch time from 8min to 88s (roughly 5.5x speedup)
+I wrote this to a file in Kaggle's Jupyter notebook via 
+%%writefile train.py
+<paste> the file
+
+File ends up in /kaggle/working/train.py
+
+Using these optimization brought my training time down from 88s -> 68s.
 """
-
 import torch
 from torch import nn, optim
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import torchvision
 import torchvision.transforms as transforms
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import matplotlib.pyplot as plt
 import numpy as np
-import os
+import os, sys, io, tarfile, logging
 
 
-print(torch.cuda.is_available())
-torch.cuda.device_count()
+
+# --- Logger with timestamps (configured so it actually prints inside Jupyter) ---
+logger = logging.getLogger('mae_train')
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+_h = logging.StreamHandler(sys.stdout)
+_h.setFormatter(logging.Formatter('%(asctime)s | %(message)s', datefmt='%H:%M:%S'))
+logger.addHandler(_h)
+logger.propagate = False
+
+
+dist.init_process_group(backend="nccl")
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
+device = torch.device("cuda", local_rank)
+world_size = dist.get_world_size()
+is_main = dist.get_rank() == 0
 torch.backends.cudnn.benchmark = True
-
-device = torch.device('cuda:0')
-
 
 # Configurations
 cfg = {
@@ -45,7 +61,7 @@ cfg = {
         "n_heads_dec": 4,
     },
     "metadata": {
-        "world_size" : 2,
+        "world_size" : None, # torchrun controlled
         "lr": 1.5e-4,
         "batch_size": 4096,
         "weight_decay": 0.05,
@@ -56,10 +72,9 @@ cfg = {
         "use_autocast": True,
         "use_grad_accumulation": True,
         "micro_batch_size" : 512,
-        "use_grad_checkpoint": False,
         "load_model": False,
         "r_model_path": "",
-        "checkpoint_every": 50,
+        "checkpoint_every": 25,
         "plot_every": 10,
         "output_dir" : "/kaggle/working",
         "checkpoint_dir" : "/kaggle/working/checkpoints"
@@ -83,7 +98,7 @@ D_DEC            = cfg["model"]["d_dec"]
 N_HEADS_DEC      = cfg["model"]["n_heads_dec"]
 N_DECODER_BLOCKS = cfg["model"]["n_decoder_blocks"]
 # Training
-WORLD_SIZE            = cfg["metadata"]["world_size"]
+WORLD_SIZE            = cfg["metadata"]["world_size"] or world_size
 LR                    = cfg["metadata"]["lr"]
 BATCH_SIZE            = cfg["metadata"]["batch_size"]
 WEIGHT_DECAY          = cfg["metadata"]["weight_decay"]
@@ -94,7 +109,6 @@ PERCENT_UNMASKED      = cfg["metadata"]["percent_unmasked"]
 USE_AUTOCAST          = cfg["metadata"]["use_autocast"]
 USE_GRAD_ACCUMULATION = cfg["metadata"]["use_grad_accumulation"]
 MICRO_BATCH_SIZE      = cfg["metadata"]["micro_batch_size"]
-USE_GRAD_CHECKPOINT   = cfg["metadata"]["use_grad_checkpoint"]
 LOAD_MODEL            = cfg["metadata"]["load_model"]
 R_MODEL_PATH          = cfg["metadata"]["r_model_path"]
 CHECKPOINT_EVERY      = cfg["metadata"]["checkpoint_every"] # epochs between compressed checkpoints
@@ -122,6 +136,8 @@ test_transform = transforms.Compose([
 ])
 
 
+if is_main:
+    logger.info("Loading STL10 dataset")
 # Load datasets
 # supervised_trainset = torchvision.datasets.STL10(
 #     root='/kaggle/input/datasets/pratt3000/stl10-binary-files/', split='train', download=False, transform=train_transform
@@ -137,19 +153,19 @@ unlabeled_set = torchvision.datasets.STL10(
 
 # DataLoaders
 micro_batch_size = MICRO_BATCH_SIZE if USE_GRAD_ACCUMULATION else BATCH_SIZE
-if WORLD_SIZE > 1:
-    micro_batch_size *= WORLD_SIZE
-# supervised_trainloader = torch.utils.data.DataLoader(
+train_sampler = DistributedSampler(unlabeled_set, shuffle=True, drop_last=True)
+
+# supervised_trainloader = DataLoader(
 #     supervised_trainset, batch_size=micro_batch_size, shuffle=True, num_workers=2
 # )
-# testloader = torch.utils.data.DataLoader(
+# testloader = DataLoader(
 #     testset, batch_size=micro_batch_size, shuffle=False, num_workers=2
 # )
-ssl_trainloader = torch.utils.data.DataLoader(
+ssl_trainloader = DataLoader(
     unlabeled_set, 
     batch_size=micro_batch_size, 
-    shuffle=True, 
-    num_workers=4, 
+    num_workers=3, 
+    sampler=train_sampler,
     drop_last=True, 
     pin_memory=True, 
     persistent_workers=True, 
@@ -318,7 +334,7 @@ class Net(nn.Module):
         # Run through all Encoder Blocks
         for block in self.encoder_blocks:
             x = block['norm_a'](embeddings)
-            x, _ = block['msa'](x, x, x)
+            x, _ = block['msa'](x, x, x, need_weights=False)
             embeddings = embeddings + x # skip connection
             x = block['norm_b'](embeddings)
             x = F.gelu( block['mlp_a'](x) )
@@ -345,7 +361,7 @@ class Net(nn.Module):
 
         for block in self.decoder_blocks:
             x = block['norm_a'](embeddings_dec)
-            x, _ = block['msa'](x, x, x)
+            x, _ = block['msa'](x, x, x, need_weights=False)
             embeddings_dec = embeddings_dec + x
             x = block['norm_b'](embeddings_dec)
             x = F.gelu( block['mlp_a'](x) )
@@ -358,7 +374,7 @@ class Net(nn.Module):
     
 
 
-net = Net(
+raw_model = Net(
     n_encoder_blocks=N_ENCODER_BLOCKS,
     n_decoder_blocks=N_DECODER_BLOCKS,
     d_image=D_IMAGE,
@@ -375,24 +391,11 @@ net = Net(
     pos_embeddings_enc=pos_embeddings_enc,
     pos_embeddings_dec=pos_embeddings_dec,
     percent_unmasked=PERCENT_UNMASKED)
-net.to(device)
+raw_model.to(device)
 
-
-
-
-import os, sys, io, tarfile, logging
 
 # --- Output locations (on Kaggle, /kaggle/working is downloadable) ---
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-
-# --- Logger with timestamps (configured so it actually prints inside Jupyter) ---
-logger = logging.getLogger('mae_train')
-logger.setLevel(logging.INFO)
-logger.handlers.clear()
-_h = logging.StreamHandler(sys.stdout)
-_h.setFormatter(logging.Formatter('%(asctime)s | %(message)s', datefmt='%H:%M:%S'))
-logger.addHandler(_h)
-logger.propagate = False
 
 # --- Checkpoint helpers ---
 def save_checkpoint(state, path):
@@ -429,17 +432,17 @@ def load_compressed_checkpoint(tar_path, map_location=None):
 # os.remove(_tar)
 
 
+ddp_model = DDP(raw_model, device_ids=[local_rank])
+model = torch.compile(ddp_model)
 
-
-net = nn.DataParallel(net)
-logger.info(f"Using DataParallel across {WORLD_SIZE} GPUs")
-
-
+if is_main:
+    logger.info(f"Using DistributedDataParallel across {WORLD_SIZE} GPUs. Starting training")
+    logger.info(f"Running version 2")
 
 
 criterion = nn.MSELoss()
 optimizer = optim.AdamW(
-    net.parameters(),
+    raw_model.parameters(),
     lr=LR,
     betas=tuple(MOMENTUM),   # MOMENTUM is the [0.9, 0.95] list -> tuple
     eps=1e-8,                # no config var for eps, kept as before
@@ -456,14 +459,14 @@ ACCUM_STEPS = BATCH_SIZE // (MICRO_BATCH_SIZE * WORLD_SIZE) if USE_GRAD_ACCUMULA
 train_losses = []
 for epoch in range(N_EPOCHS):
     epoch_loss = torch.zeros((), device=device)
-    running_loss = torch.zeros((), device=device)
     accum_count = 0
     optimizer.zero_grad()
     for i, data in enumerate(ssl_trainloader):
         inputs = data[0].to(device, non_blocking=True)
+        is_step = (i + 1) % ACCUM_STEPS == 0 or (i + 1) == len(ssl_trainloader)
 
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=USE_AUTOCAST):
-            y_pred_patches, y_true_patches, ids_masked = net(inputs)
+            y_pred_patches, y_true_patches, ids_masked = model(inputs)
             masked_indices = ids_masked.unsqueeze(-1).expand(-1, -1, D_PATCH)
             y_pred_masked_patches = torch.gather(y_pred_patches, 1, masked_indices)
     
@@ -476,64 +479,72 @@ for epoch in range(N_EPOCHS):
     
             loss = criterion(y_pred_masked_patches, y_true_patches)
             
-        scaler.scale(loss / ACCUM_STEPS).backward()
-        running_loss += loss.detach()
         epoch_loss += loss.detach()
         accum_count += 1
-        if (i + 1) % ACCUM_STEPS == 0 or (i + 1) == len(ssl_trainloader):
-            # logger.info(f"epoch {epoch}, index {i}, running_loss {(running_loss / accum_count).item():.6f}") # sync at log time
+
+        if is_step:
+            scaler.scale(loss / ACCUM_STEPS).backward() # trigger DDP all-reduce with gradient_buckets
             scaler.step(optimizer) # will function as identity when USE_AUTOCAST false
             scaler.update()
             optimizer.zero_grad()
             running_loss = torch.zeros((), device=device)
             accum_count = 0
+        else:
+            with ddp_model.no_sync():
+                scaler.scale(loss / ACCUM_STEPS).backward()
         
-
-    avg_loss = (epoch_loss / len(ssl_trainloader)).item()
-    train_losses.append(avg_loss)
     scheduler.step()
-    logger.info(f'Epoch {epoch + 1}/{N_EPOCHS} - loss: {avg_loss:.6f}')
+    dist.all_reduce(epoch_loss, op=dist.ReduceOp.SUM)
+    avg_loss = (epoch_loss / (len(ssl_trainloader) * WORLD_SIZE)).item()
+    
+    if is_main:
+        train_losses.append(avg_loss)
+        logger.info(f'Epoch {epoch + 1}/{N_EPOCHS} - loss: {avg_loss:.6f}')
 
-    # always-overwritten 'latest' for crash recovery (uncompressed, fast)
-    model_sd = net.module.state_dict() if isinstance(net, nn.DataParallel) else net.state_dict()
-    save_checkpoint({
-        'epoch': epoch + 1,
-        'model_state_dict': model_sd,
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'scaler_state_dict' : scaler.state_dict(),
-        'loss': avg_loss,
-    }, f'{CHECKPOINT_DIR}/latest.pt')
-
-    # refresh the downloadable loss curve
-    if (epoch + 1) % PLOT_EVERY == 0:
-        plt.figure(figsize=(14, 4))
-        plt.subplot(1, 2, 1)
-        plt.plot(train_losses)
-        plt.xlabel("Epoch"); plt.ylabel("MSE Loss")
-        plt.title("MAE Training Loss (Full)")
-        plt.yscale("log")
-        plt.subplot(1, 2, 2)
-        last_n = min(10, len(train_losses))
-        plt.plot(range(len(train_losses) - last_n, len(train_losses)), train_losses[-last_n:])
-        plt.xlabel("Epoch"); plt.ylabel("MSE Loss")
-        plt.title("MAE Training Loss (Last 10 Epochs)")
-        plt.tight_layout()
-        plt.savefig(f"{OUTPUT_DIR}/loss_curve.png")
-        plt.close()
-
-    # periodic compressed snapshot for history
-    if (epoch + 1) % CHECKPOINT_EVERY == 0:
-        tar_path = save_compressed_checkpoint({
+        # always-overwritten 'latest' for crash recovery (uncompressed, fast)
+        save_checkpoint({
             'epoch': epoch + 1,
-            'model_state_dict': model_sd,
+            'model_state_dict': raw_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'scaler_state_dict' : scaler.state_dict(),
             'loss': avg_loss,
-        }, f'{CHECKPOINT_DIR}/checkpoint_epoch_{epoch + 1}.pt')
-        logger.info(f'Checkpoint saved: {tar_path}')
+        }, f'{CHECKPOINT_DIR}/latest.pt')
 
-logger.info('Finished training')
+        # refresh the downloadable loss curve
+        if (epoch + 1) % PLOT_EVERY == 0:
+            plt.figure(figsize=(14, 4))
+            plt.subplot(1, 2, 1)
+            plt.plot(train_losses)
+            plt.xlabel("Epoch"); plt.ylabel("MSE Loss")
+            plt.title("MAE Training Loss (Full)")
+            plt.yscale("log")
+            plt.subplot(1, 2, 2)
+            last_n = min(10, len(train_losses))
+            plt.plot(range(len(train_losses) - last_n, len(train_losses)), train_losses[-last_n:])
+            plt.xlabel("Epoch"); plt.ylabel("MSE Loss")
+            plt.title("MAE Training Loss (Last 10 Epochs)")
+            plt.tight_layout()
+            plt.savefig(f"{OUTPUT_DIR}/loss_curve.png")
+            plt.close()
+
+        # periodic compressed snapshot for history
+        if (epoch + 1) % CHECKPOINT_EVERY == 0:
+            tar_path = save_compressed_checkpoint({
+                'epoch': epoch + 1,
+                'model_state_dict': raw_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'scaler_state_dict' : scaler.state_dict(),
+                'loss': avg_loss,
+            }, f'{CHECKPOINT_DIR}/checkpoint_epoch_{epoch + 1}.pt')
+            logger.info(f'Checkpoint saved: {tar_path}')
+
+    dist.barrier() # keep ranks in step before continuining
+
+dist.destroy_process_group()
+
+if is_main:
+    logger.info('Finished training')
 
 
