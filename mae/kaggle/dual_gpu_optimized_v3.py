@@ -64,7 +64,7 @@ cfg = {
         "micro_batch_size" : 512,
         "load_model": False,
         "r_model_path": "",
-        "checkpoint_every": 25,
+        "checkpoint_every": 20,
         "plot_every": 10,
         "output_dir" : "/kaggle/working",
         "checkpoint_dir" : "/kaggle/working/checkpoints",
@@ -411,12 +411,13 @@ raw_model.to(device)
 # --- Output locations (on Kaggle, /kaggle/working is downloadable) ---
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-def upload_checkpoint_hf(path):
+def upload_file_hf(path):
     hf_api.upload_file(
         path_or_fileobj=path,
         path_in_repo=(os.path.join(HF_OUTPUT_DIR, os.path.basename(path))),
         repo_id=HF_REPO,
-        HF_REPO="model"
+        repo_type="model",
+        silent=True
     )
 
 # --- Checkpoint helpers ---
@@ -424,7 +425,7 @@ def save_checkpoint(state, path):
     """Uncompressed save (fast). Used for the always-overwritten 'latest'."""
     torch.save(state, path)
     if USE_HF:
-        upload_checkpoint_hf(path)
+        upload_file_hf(path)
     return path
 
 def save_compressed_checkpoint(state, path):
@@ -435,7 +436,7 @@ def save_compressed_checkpoint(state, path):
         tar.add(path, arcname=os.path.basename(path))
 
     if USE_HF:
-        upload_checkpoint_hf(path)
+        upload_file_hf(tar_path)
 
     os.remove(path)
     return tar_path
@@ -529,15 +530,15 @@ for epoch in range(N_EPOCHS):
         train_losses.append(avg_loss)
         logger.info(f'Epoch {epoch + 1}/{N_EPOCHS} - loss: {avg_loss:.6f}')
 
-        # always-overwritten 'latest' for crash recovery (uncompressed, fast)
-        save_checkpoint({
-            'epoch': epoch + 1,
-            'model_state_dict': raw_model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'scaler_state_dict' : scaler.state_dict(),
-            'loss': avg_loss,
-        }, f'{CHECKPOINT_DIR}/latest.pt')
+        # # always-overwritten 'latest' for crash recovery (uncompressed, fast)
+        # save_checkpoint({
+        #     'epoch': epoch + 1,
+        #     'model_state_dict': raw_model.state_dict(),
+        #     'optimizer_state_dict': optimizer.state_dict(),
+        #     'scheduler_state_dict': scheduler.state_dict(),
+        #     'scaler_state_dict' : scaler.state_dict(),
+        #     'loss': avg_loss,
+        # }, f'{CHECKPOINT_DIR}/latest.pt')
 
         # refresh the downloadable loss curve
         if (epoch + 1) % PLOT_EVERY == 0:
@@ -553,12 +554,16 @@ for epoch in range(N_EPOCHS):
             plt.xlabel("Epoch"); plt.ylabel("MSE Loss")
             plt.title("MAE Training Loss (Last 10 Epochs)")
             plt.tight_layout()
-            plt.savefig(f"{OUTPUT_DIR}/loss_curve.png")
+            plot_path = os.path.join(OUTPUT_DIR, "loss_curve.png")
+            plt.savefig(plot_path)
             plt.close()
+
+            if USE_HF:
+                upload_file_hf(plot_path)
 
         # periodic compressed snapshot for history
         if (epoch + 1) % CHECKPOINT_EVERY == 0:
-            tar_path = save_compressed_checkpoint({
+            path = save_checkpoint({
                 'epoch': epoch + 1,
                 'model_state_dict': raw_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
@@ -566,7 +571,7 @@ for epoch in range(N_EPOCHS):
                 'scaler_state_dict' : scaler.state_dict(),
                 'loss': avg_loss,
             }, f'{CHECKPOINT_DIR}/checkpoint_epoch_{epoch + 1}.pt')
-            logger.info(f'Checkpoint saved: {tar_path}')
+            logger.info(f'Checkpoint saved: {path}')
 
     dist.barrier() # keep ranks in step before continuining
 
