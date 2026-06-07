@@ -13,7 +13,9 @@ import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 import numpy as np
 import os, sys, io, tarfile, logging, json
-from huggingface_hub import login, HfApi
+from huggingface_hub import login, HfApi, utils as hf_utils
+
+hf_utils.disable_progress_bars()
 
 
 # --- Logger with timestamps (configured so it actually prints inside Jupyter) ---
@@ -416,8 +418,7 @@ def upload_file_hf(path):
         path_or_fileobj=path,
         path_in_repo=(os.path.join(HF_OUTPUT_DIR, os.path.basename(path))),
         repo_id=HF_REPO,
-        repo_type="model",
-        silent=True
+        repo_type="model"
     )
 
 # --- Checkpoint helpers ---
