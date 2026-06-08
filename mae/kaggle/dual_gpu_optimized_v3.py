@@ -12,8 +12,15 @@ import torchvision
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 import numpy as np
-import os, sys, io, tarfile, logging, json
-from huggingface_hub import login, HfApi, utils as hf_utils
+import os
+import sys
+import io
+from contextlib import contextmanager 
+import tarfile
+import logging
+import json
+from huggingface_hub import login as hf_login, HfApi, utils as hf_utils, hf_hub_download
+
 
 hf_utils.disable_progress_bars()
 
@@ -53,6 +60,7 @@ cfg = {
         "n_heads_dec": 4,
     },
     "metadata": {
+        "data_path" : "/kaggle/input/datasets/pratt3000/stl10-binary-files/",
         "world_size" : None, # torchrun controlled
         "lr": 1.5e-4,
         "batch_size": 4096,
@@ -64,15 +72,19 @@ cfg = {
         "use_autocast": True,
         "use_grad_accumulation": True,
         "micro_batch_size" : 512,
-        "load_model": False,
-        "r_model_path": "",
+        "load_model": True,
+        "r_model_path": "/kaggle/working/checkpoint_epoch_680.pt",
         "checkpoint_every": 20,
+        "save_latest_checkpoint": False,
         "plot_every": 10,
-        "output_dir" : "/kaggle/working",
+        "output_dir" : "/kaggle/working", # where loss curve & presumably checkpoint dir exists
         "checkpoint_dir" : "/kaggle/working/checkpoints",
+        "is_kaggle" : True,
         "use_hf" : True,
         "hf_repo" : "flamma77/mae",
-        "hf_output_dir" : "ViT-S-model-1"
+        "hf_output_dir" : "ViT-S-model-1",
+        "hf_pull_model": True,
+        "hf_pull_model_path" : "ViT-S-model-1/checkpoint_epoch_680.pt"
     },
 }
 
@@ -93,26 +105,31 @@ D_DEC            = cfg["model"]["d_dec"]
 N_HEADS_DEC      = cfg["model"]["n_heads_dec"]
 N_DECODER_BLOCKS = cfg["model"]["n_decoder_blocks"]
 # Training
-WORLD_SIZE            = cfg["metadata"]["world_size"] or world_size
-LR                    = cfg["metadata"]["lr"]
-BATCH_SIZE            = cfg["metadata"]["batch_size"]
-WEIGHT_DECAY          = cfg["metadata"]["weight_decay"]
-MOMENTUM              = cfg["metadata"]["momentum"]            # [0.9, 0.95]
-WARMUP_EPOCHS         = cfg["metadata"]["warmup_epochs"]
-N_EPOCHS              = cfg["metadata"]["n_epochs"]
-PERCENT_UNMASKED      = cfg["metadata"]["percent_unmasked"]
-USE_AUTOCAST          = cfg["metadata"]["use_autocast"]
-USE_GRAD_ACCUMULATION = cfg["metadata"]["use_grad_accumulation"]
-MICRO_BATCH_SIZE      = cfg["metadata"]["micro_batch_size"]
-LOAD_MODEL            = cfg["metadata"]["load_model"]
-R_MODEL_PATH          = cfg["metadata"]["r_model_path"]
-CHECKPOINT_EVERY      = cfg["metadata"]["checkpoint_every"] # epochs between compressed checkpoints
-PLOT_EVERY            = cfg["metadata"]["plot_every"] # epochs between loss-curve refreshes
-OUTPUT_DIR            = cfg["metadata"]["output_dir"]
-CHECKPOINT_DIR        = cfg["metadata"]["checkpoint_dir"]
-USE_HF                = cfg["metadata"]["use_hf"]
-HF_REPO               = cfg["metadata"]["hf_repo"]
-HF_OUTPUT_DIR         = cfg["metadata"]["hf_output_dir"]
+DATA_PATH              = cfg["metadata"]["data_path"]
+WORLD_SIZE             = cfg["metadata"]["world_size"] or world_size
+LR                     = cfg["metadata"]["lr"]
+BATCH_SIZE             = cfg["metadata"]["batch_size"]
+WEIGHT_DECAY           = cfg["metadata"]["weight_decay"]
+MOMENTUM               = cfg["metadata"]["momentum"]            # [0.9, 0.95]
+WARMUP_EPOCHS          = cfg["metadata"]["warmup_epochs"]
+N_EPOCHS               = cfg["metadata"]["n_epochs"]
+PERCENT_UNMASKED       = cfg["metadata"]["percent_unmasked"]
+USE_AUTOCAST           = cfg["metadata"]["use_autocast"]
+USE_GRAD_ACCUMULATION  = cfg["metadata"]["use_grad_accumulation"]
+MICRO_BATCH_SIZE       = cfg["metadata"]["micro_batch_size"]
+LOAD_MODEL             = cfg["metadata"]["load_model"]
+R_MODEL_PATH           = cfg["metadata"]["r_model_path"]
+CHECKPOINT_EVERY       = cfg["metadata"]["checkpoint_every"] # epochs between compressed checkpoints
+SAVE_LATEST_CHECKPOINT = cfg["metadata"]["save_latest_checkpoint"]
+PLOT_EVERY             = cfg["metadata"]["plot_every"] # epochs between loss-curve refreshes
+OUTPUT_DIR             = cfg["metadata"]["output_dir"]
+CHECKPOINT_DIR         = cfg["metadata"]["checkpoint_dir"]
+IS_KAGGLE              = cfg["metadata"]["is_kaggle"]
+USE_HF                 = cfg["metadata"]["use_hf"]
+HF_REPO                = cfg["metadata"]["hf_repo"]
+HF_OUTPUT_DIR          = cfg["metadata"]["hf_output_dir"]
+HF_PULL_MODEL          = cfg["metadata"]["hf_pull_model"]
+HF_PULL_MODEL_PATH     = cfg["metadata"]["hf_pull_model_path"]
 # --- Derived params (computed) ---
 D_PATCH   = (PATCH_SIZE ** 2) * N_CHANNELS 
 N_PATCHES = (D_IMAGE ** 2) // (PATCH_SIZE ** 2)
@@ -123,10 +140,13 @@ D_DEC_MLP = int(MLP_RATIO * D_DEC)
 
 if is_main and USE_HF:
     # HuggingFace Authenticate
-    from kaggle_secrets import UserSecretsClient
-
-    token = UserSecretsClient().get_secret("HF_TOKEN")
-    login(token=token)
+    if IS_KAGGLE:
+        from kaggle_secrets import UserSecretsClient
+        token = UserSecretsClient().get_secret("HF_TOKEN")
+    else:
+        token = os.environ["HF_TOKEN"] # load HF_TOKEN locally
+        pass
+    hf_login(token=token)
     hf_api = HfApi()
     # Save JSON Configuration path
     config_path = os.path.join(OUTPUT_DIR, "config.json")
@@ -156,13 +176,13 @@ if is_main:
     logger.info("Loading STL10 dataset")
 # Load datasets
 # supervised_trainset = torchvision.datasets.STL10(
-#     root='/kaggle/input/datasets/pratt3000/stl10-binary-files/', split='train', download=False, transform=train_transform
+#     root=DATA_PATH, split='train', download=False, transform=train_transform
 # )
 # testset = torchvision.datasets.STL10(
-#     root='/kaggle/input/datasets/pratt3000/stl10-binary-files/', split='test', download=False, transform=test_transform
+#     root=DATA_PATH, split='test', download=False, transform=test_transform
 # )
 unlabeled_set = torchvision.datasets.STL10(
-    root='/kaggle/input/datasets/pratt3000/stl10-binary-files/', split='unlabeled', download=False, transform=train_transform
+    root=DATA_PATH, split='unlabeled', download=False, transform=train_transform
 )
 
 
@@ -187,6 +207,57 @@ ssl_trainloader = DataLoader(
     persistent_workers=True, 
     prefetch_factor=2,
 )
+
+
+# --- Output locations (on Kaggle, /kaggle/working is downloadable) ---
+if is_main:
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+def upload_file_hf(path):
+    hf_api.upload_file(
+        path_or_fileobj=path,
+        path_in_repo=(os.path.join(HF_OUTPUT_DIR, os.path.basename(path))),
+        repo_id=HF_REPO,
+        repo_type="model"
+    )
+
+# --- Checkpoint helpers ---
+def save_checkpoint(state, path):
+    """Uncompressed save (fast). Used for the always-overwritten 'latest'."""
+    torch.save(state, path)
+    return path
+
+def save_compressed_checkpoint(state, path):
+    """Save then gzip-tar it; removes the .pt and returns the .tar.gz path."""
+    torch.save(state, path)
+    tar_path = path + '.tar.gz'
+    with tarfile.open(tar_path, 'w:gz') as tar:
+        tar.add(path, arcname=os.path.basename(path))
+
+    if USE_HF:
+        upload_file_hf(tar_path)
+
+    os.remove(path)
+    return tar_path
+
+def load_compressed_checkpoint(tar_path, map_location=None):
+    """Load a checkpoint written by save_compressed_checkpoint."""
+    with tarfile.open(tar_path, 'r:gz') as tar:
+        member = tar.getmembers()[0]
+        buffer = io.BytesIO(tar.extractfile(member).read())
+    # weights_only=False because this is your own trusted file and it holds
+    # optimizer/scheduler state; torch>=2.6 defaults to True and would choke on it.
+    return torch.load(buffer, map_location=map_location, weights_only=False)
+    
+
+
+
+# _test_state = {'epoch': 0, 'model_state_dict': net.state_dict(), 'loss': 0.0}
+# _tar = save_compressed_checkpoint(_test_state, f'{CHECKPOINT_DIR}/_test.pt')
+# print('Wrote:', _tar, f'({os.path.getsize(_tar) / 1e6:.1f} MB)')
+# _loaded = load_compressed_checkpoint(_tar, map_location='cpu')
+# print('Round-trip OK - keys:', list(_loaded.keys()), '| epoch:', _loaded['epoch'])
+# os.remove(_tar)
 
 
 def get_pos_embeddings(D, n_patches, n_rows):
@@ -409,66 +480,13 @@ raw_model = Net(
     percent_unmasked=PERCENT_UNMASKED)
 raw_model.to(device)
 
-
-# --- Output locations (on Kaggle, /kaggle/working is downloadable) ---
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-
-def upload_file_hf(path):
-    hf_api.upload_file(
-        path_or_fileobj=path,
-        path_in_repo=(os.path.join(HF_OUTPUT_DIR, os.path.basename(path))),
-        repo_id=HF_REPO,
-        repo_type="model"
-    )
-
-# --- Checkpoint helpers ---
-def save_checkpoint(state, path):
-    """Uncompressed save (fast). Used for the always-overwritten 'latest'."""
-    torch.save(state, path)
-    if USE_HF:
-        upload_file_hf(path)
-    return path
-
-def save_compressed_checkpoint(state, path):
-    """Save then gzip-tar it; removes the .pt and returns the .tar.gz path."""
-    torch.save(state, path)
-    tar_path = path + '.tar.gz'
-    with tarfile.open(tar_path, 'w:gz') as tar:
-        tar.add(path, arcname=os.path.basename(path))
-
-    if USE_HF:
-        upload_file_hf(tar_path)
-
-    os.remove(path)
-    return tar_path
-
-def load_compressed_checkpoint(tar_path, map_location=None):
-    """Load a checkpoint written by save_compressed_checkpoint."""
-    with tarfile.open(tar_path, 'r:gz') as tar:
-        member = tar.getmembers()[0]
-        buffer = io.BytesIO(tar.extractfile(member).read())
-    # weights_only=False because this is your own trusted file and it holds
-    # optimizer/scheduler state; torch>=2.6 defaults to True and would choke on it.
-    return torch.load(buffer, map_location=map_location, weights_only=False)
-    
-
-
-
-# _test_state = {'epoch': 0, 'model_state_dict': net.state_dict(), 'loss': 0.0}
-# _tar = save_compressed_checkpoint(_test_state, f'{CHECKPOINT_DIR}/_test.pt')
-# print('Wrote:', _tar, f'({os.path.getsize(_tar) / 1e6:.1f} MB)')
-# _loaded = load_compressed_checkpoint(_tar, map_location='cpu')
-# print('Round-trip OK - keys:', list(_loaded.keys()), '| epoch:', _loaded['epoch'])
-# os.remove(_tar)
-
-
-ddp_model = DDP(raw_model, device_ids=[local_rank])
-model = torch.compile(ddp_model)
-
-if is_main:
-    logger.info(f"Using DistributedDataParallel across {WORLD_SIZE} GPUs. Starting training")
-    logger.info(f"Running version 2")
-
+@contextmanager
+def wait_for_hf_model_pull():
+    if not is_main:
+        dist.barrier()
+    yield
+    if is_main:
+        dist.barrier()
 
 criterion = nn.MSELoss()
 optimizer = optim.AdamW(
@@ -484,10 +502,46 @@ warmup = LinearLR(optimizer, start_factor=1/WARMUP_EPOCHS, total_iters=WARMUP_EP
 cosine = CosineAnnealingLR(optimizer, N_EPOCHS - WARMUP_EPOCHS)
 scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[WARMUP_EPOCHS])
 
+if LOAD_MODEL:
+    if HF_PULL_MODEL:
+        with wait_for_hf_model_pull():
+            if is_main:
+                path = hf_hub_download(
+                    repo_id=HF_REPO,
+                    filename=HF_PULL_MODEL_PATH,
+                    local_dir=os.path.dirname(R_MODEL_PATH)
+                )
+                os.rename(path, R_MODEL_PATH)
+                logger.info(f"Downloaded to: {R_MODEL_PATH}")
+                logger.info("Size: {:.1f} MB".format(os.path.getsize(R_MODEL_PATH) / 1e6))
+    state = torch.load(R_MODEL_PATH, map_location=device, weights_only=False)
+
+    raw_model.load_state_dict(state['model_state_dict'])
+    optimizer.load_state_dict(state['optimizer_state_dict'])
+    scheduler.load_state_dict(state['scheduler_state_dict'])
+    scaler.load_state_dict(state['scaler_state_dict'])
+    start_epoch = state['epoch']
+
+    if is_main:
+        logger.info(f"Resumed from {R_MODEL_PATH} at epoch {start_epoch} "
+                    f"(saved loss {state['loss']:.4f})")
+
+else:
+    start_epoch = 0
+    
+
+ddp_model = DDP(raw_model)
+model = torch.compile(ddp_model)
+
+if is_main:
+    logger.info(f"Using DistributedDataParallel across {WORLD_SIZE} GPUs. Starting training")
+    logger.info(f"Running version 2")
+
+
 ACCUM_STEPS = BATCH_SIZE // (MICRO_BATCH_SIZE * WORLD_SIZE) if USE_GRAD_ACCUMULATION else 1
 
 train_losses = []
-for epoch in range(N_EPOCHS):
+for epoch in range(start_epoch, N_EPOCHS):
     epoch_loss = torch.zeros((), device=device)
     accum_count = 0
     optimizer.zero_grad()
@@ -531,15 +585,16 @@ for epoch in range(N_EPOCHS):
         train_losses.append(avg_loss)
         logger.info(f'Epoch {epoch + 1}/{N_EPOCHS} - loss: {avg_loss:.6f}')
 
-        # # always-overwritten 'latest' for crash recovery (uncompressed, fast)
-        # save_checkpoint({
-        #     'epoch': epoch + 1,
-        #     'model_state_dict': raw_model.state_dict(),
-        #     'optimizer_state_dict': optimizer.state_dict(),
-        #     'scheduler_state_dict': scheduler.state_dict(),
-        #     'scaler_state_dict' : scaler.state_dict(),
-        #     'loss': avg_loss,
-        # }, f'{CHECKPOINT_DIR}/latest.pt')
+        if SAVE_LATEST_CHECKPOINT:
+            # always-overwritten 'latest' for crash recovery (uncompressed, fast)
+            save_checkpoint({
+                'epoch': epoch + 1,
+                'model_state_dict': raw_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'scaler_state_dict' : scaler.state_dict(),
+                'loss': avg_loss,
+            }, f'{CHECKPOINT_DIR}/latest.pt')
 
         # refresh the downloadable loss curve
         if (epoch + 1) % PLOT_EVERY == 0:
