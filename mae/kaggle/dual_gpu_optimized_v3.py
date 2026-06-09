@@ -225,6 +225,10 @@ def upload_file_hf(path):
 def save_checkpoint(state, path):
     """Uncompressed save (fast). Used for the always-overwritten 'latest'."""
     torch.save(state, path)
+
+    if USE_HF:
+        upload_file_hf(path)
+
     return path
 
 def save_compressed_checkpoint(state, path):

@@ -1,10 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 import numpy as np
 
-def get_pos_embeddings(D, n_patches, n_rows, device):
+def get_pos_embeddings(D, n_patches, n_rows):
     D_pos = D // 2 # 96
     row_pos = np.zeros((n_rows, D_pos))
     col_pos = np.zeros((n_rows, D_pos))
@@ -25,7 +24,6 @@ def get_pos_embeddings(D, n_patches, n_rows, device):
         for col in range(0, n_rows):
             pos_embeddings[row*n_rows + col, :] = np.concatenate([row_pos[row, :], col_pos[col, :]])
     pos_embeddings = torch.tensor(pos_embeddings, dtype=torch.float32)
-    pos_embeddings = pos_embeddings.to(device)
     return pos_embeddings
 
 class Net(nn.Module):
@@ -70,7 +68,7 @@ class Net(nn.Module):
         n_heads_enc,
         n_heads_dec,
         pos_embeddings_enc,
-        pos_embedding_dec,
+        pos_embeddings_dec,
         percent_unmasked,
     ):
         super(Net, self).__init__()
@@ -84,10 +82,9 @@ class Net(nn.Module):
         self.d_enc_mlp = d_enc_mlp
         self.d_dec = d_dec
         self.d_dec_mlp = d_dec_mlp
-        self.pos_embeddings_enc = pos_embeddings_enc
-        self.pos_embeddings_dec = pos_embedding_dec
+        self.register_buffer("pos_embeddings_enc", pos_embeddings_enc)
+        self.register_buffer("pos_embeddings_dec", pos_embeddings_dec)
         self.percent_unmasked = percent_unmasked
-
 
         ### ENCODER
         self.img2enc_projection = nn.Linear(d_patch, d_enc)
@@ -161,7 +158,7 @@ class Net(nn.Module):
         # Run through all Encoder Blocks
         for block in self.encoder_blocks:
             x = block['norm_a'](embeddings)
-            x, _ = block['msa'](x, x, x)
+            x, _ = block['msa'](x, x, x, need_weights=False)
             embeddings = embeddings + x # skip connection
             x = block['norm_b'](embeddings)
             x = F.gelu( block['mlp_a'](x) )
@@ -188,108 +185,12 @@ class Net(nn.Module):
 
         for block in self.decoder_blocks:
             x = block['norm_a'](embeddings_dec)
-            x, _ = block['msa'](x, x, x)
+            x, _ = block['msa'](x, x, x, need_weights=False)
             embeddings_dec = embeddings_dec + x
             x = block['norm_b'](embeddings_dec)
             x = F.gelu( block['mlp_a'](x) )
             x = block['mlp_b'](x)
             embeddings_dec = embeddings_dec + x
-
-        y_patches = self.dec2img_projection(embeddings_dec)
-
-        return y_patches, truth_patches, ids_masked
-    
-
-
-"""
-Net with GradientCheckpoint capability added
-"""
-
-
-class NetCheckpoint(Net):
-
-    # __init__ inherits from Net()
-
-    def encode(self, x):
-        # x is (B, C, H, W) = (B, 3, 96, 96)
-        B, C, H, W = x.shape
-
-        # Make (B, 3, 12, 12, 8, 8)
-        patches = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
-        # assert patches.shape == (B, C, self.n_rows, self.n_rows, self.patch_size, self.patch_size), patches.shape 
-        
-        # Make (B, 12, 12, 3, 8, 8)
-        x = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
-        # assert x.shape == (B, self.n_rows, self.n_rows, C, self.patch_size, self.patch_size), x.shape
-
-        SEQ = self.n_patches # N_ROWS ** 2
-
-        x = x.view(B, SEQ, self.d_patch)
-        # assert x.shape == (B, 144, 192), x.shape
-        truth_patches = x
-
-        # Create a mask and apply it
-        noise = torch.rand(B, SEQ, device=x.device)
-        ids_shuffle = torch.argsort(noise, dim=1) # Get a list of sorted ids for each B
-        n_keep = int(SEQ * self.percent_unmasked)
-        ids_unmasked = ids_shuffle[:, :n_keep] # Store the ids of first 25% -> (B, n_keep)
-        ids_masked = ids_shuffle[:, n_keep:] # Store the ids of last 75% -> (B, n_masked)
-
-        # x_unmasked we want (B, n_keep, 192)
-        ind_unmasked_enc = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.d_patch) # (B, n_keep, d_patch)
-        
-        # For dim=1, keep all dimensions the same but replaces with the column index
-        x_unmasked = torch.gather(x, 1, ind_unmasked_enc)
-        # assert x_unmasked.shape == (B, n_keep, 192), x_unmasked.shape
-
-        embeddings = self.img2enc_projection(x_unmasked)
-
-        # Add our positional embeddings
-        # (N_PATCHES, D)
-        # embeddings is (B, n_keep, D)
-        ind_unmasked_pos = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.D)
-        local_pos_embeddings = torch.gather(self.pos_embeddings_enc.unsqueeze(0).expand(B, -1, -1), 1, ind_unmasked_pos)
-        embeddings = embeddings + local_pos_embeddings
-
-        # Run through all Encoder Blocks
-        for block in self.encoder_blocks:
-            def block_fn(emb, b=block):
-                x = b['norm_a'](emb)
-                x, _ = b['msa'](x, x, x)
-                emb = emb + x
-                x = b['norm_b'](emb)
-                x = F.gelu(b['mlp_a'](x))
-                x = b['mlp_b'](x)
-                return emb + x
-            # embeddings = block_fn(embeddings) # no checkpointing
-            embeddings = checkpoint(block_fn, embeddings, use_reentrant=False)
-
-        return embeddings, truth_patches, ids_unmasked, ids_masked
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        embeddings, truth_patches, ids_unmasked, ids_masked = self.encode(x)
-        ind_unmasked_dec = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.D_decoder) # (B, n_keep, D)
-
-        ## DECODER
-        x = self.masked_embedding.repeat(B, self.n_patches, 1)
-        # assert x.shape == (B, self.n_patches, self.D_decoder), x.shape
-        unmasked_embeddings_dec = self.enc2dec_projection(embeddings).to(x.dtype) # cast to support autocast fp16
-        embeddings_dec = x.clone().scatter(1, ind_unmasked_dec, unmasked_embeddings_dec)
-        # embeddings_dec = torch.scatter(x, 1, ind_unmasked_dec, unmasked_embeddings_dec)
-        embeddings_dec = embeddings_dec + self.pos_embeddings_dec # broadcast along B in pos_embeddings
-
-        for block in self.decoder_blocks:
-            def block_fn(emb, b=block):
-                x = b['norm_a'](emb)
-                x, _ = b['msa'](x, x, x)
-                emb = emb + x
-                x = b['norm_b'](emb)
-                x = F.gelu(b['mlp_a'](x))
-                x = b['mlp_b'](x)
-                return emb + x
-            # embeddings_dec = block_fn(embeddings_dec) # no checkpoints
-            embeddings_dec = checkpoint(block_fn, embeddings_dec, use_reentrant=False)
 
         y_patches = self.dec2img_projection(embeddings_dec)
 
