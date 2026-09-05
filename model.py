@@ -98,6 +98,7 @@ class Net(nn.Module):
             })
             for _ in range(n_encoder_blocks)
         ])
+        self.enc_terminal_norm = nn.LayerNorm(d_enc)
 
         ### DECODER (just single transformer block)
         self.masked_embedding = nn.Parameter(torch.randn(1, 1, d_dec))
@@ -112,6 +113,7 @@ class Net(nn.Module):
             })
             for _ in range(n_decoder_blocks)
         ])
+        self.dec_terminal_norm = nn.LayerNorm(d_dec)
         self.dec2img_projection = nn.Linear(d_dec, d_patch)
 
     def encode(self, x):
@@ -165,6 +167,7 @@ class Net(nn.Module):
             x = block['mlp_b'](x)
             embeddings = embeddings + x # skip connection
 
+        embeddings = self.enc_terminal_norm(embeddings)
         return embeddings, truth_patches, ids_unmasked, ids_masked
 
         # Ok now we need to return the meal across the embeddings
@@ -192,6 +195,7 @@ class Net(nn.Module):
             x = block['mlp_b'](x)
             embeddings_dec = embeddings_dec + x
 
+        embeddings_dec = self.dec_terminal_norm(embeddings_dec)
         y_patches = self.dec2img_projection(embeddings_dec)
 
         return y_patches, truth_patches, ids_masked

@@ -1,3 +1,9 @@
 *venv/
 *data/
 *.ipynb_checkpoints/
+
+checkpoints/
+
+*.pyc
+*.pt
+*.png
