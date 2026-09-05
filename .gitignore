@@ -7,3 +7,4 @@ checkpoints/
 *.pyc
 *.pt
 *.png
+!docs/assets/*.png

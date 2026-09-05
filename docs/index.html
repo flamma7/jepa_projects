@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Masked Autoencoders on STL-10</title>
+  <meta name="description" content="Self-supervised visual representation learning. A from-scratch MAE trained on STL-10.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Castoro" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="page">
+    <header>
+      <h1>Masked Autoencoders on STL-10</h1>
+      <h2 class="subtitle">Self-supervised visual representation learning</h2>
+      <p class="links">
+        <a href="https://github.com/flamma7/mae-stl10">Code</a>
+        &nbsp;|&nbsp;
+        <a href="https://huggingface.co/flamma77/mae/tree/main/ViT-S-runpod">Model weights</a>
+      </p>
+    </header>
+
+    <figure>
+      <img src="assets/mae_reconstructions.png" alt="MAE reconstructions: original images, masked inputs, and reconstructions at various epochs.">
+      <figcaption><strong>Original, masked input, and reconstructions at various epochs.</strong> The significant color differences in some patches (like the blue patches on the dog's ear or the pink patches on the deer) are the result of using per-patch normalized pixels as the reconstruction target. This removes each patch's absolute mean and scale during training; during visualization, the true mean and scale are reapplied to the prediction. This process encourages local structure/texture, but errors in the normalized precition can appear as reconstruction artifacts.</figcaption>
+
+    </figure>
+
+    <section id="approach">
+      <h2>Approach</h2>
+      <p>
+        Implemented a ViT-S encoder and 8-layer ViT decoder using the MAE training
+        recipe (75% of patches masked, 25% visible). STL-10 consists of 100k unlabeled
+        images (used for SSL pretraining), 5k labeled images for supervised
+        fine-tuning, and 8k test images. I trained the MAE on one RTX 5090 for 1600
+        epochs, then evaluated with a linear classification head, an MLP head, and
+        fine-tuning the last transformer block plus a linear head, following the
+        paper's ablation.
+      </p>
+      <figure>
+        <img src="mae_vit_s8_architecture.svg" alt="MAE architecture with ViT-S/8 encoder and lightweight decoder.">
+        <figcaption>
+          MAE architecture: 75% random masking, ViT-S/8 encoder on visible patches,
+          mask-token insertion, decoder, and MSE against normalized target patches.
+        </figcaption>
+      </figure>
+    </section>
+
+    <section id="reconstruct">
+      <h2>Learning to reconstruct</h2>
+      <p>
+        Same mask, same four test images, two checkpoints. Early reconstructions get
+        layout and hue; later ones pick up texture.
+      </p>
+      <p class="todo">Add later checkpoints or a loss curve here if you want a fuller progression.</p>
+      <figure>
+        <img src="assets/mae_reconstructions.png" alt="Reconstruction quality improving from epoch 100 to epoch 400.">
+        <figcaption>Rows: original, masked input, recon @100, recon @400.</figcaption>
+      </figure>
+    </section>
+
+    <section id="downstream">
+      <h2>Downstream evaluation</h2>
+      <p>
+        Frozen-encoder probes, then last-block fine-tuning. Numbers below are placeholders.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Method</th>
+              <th>Epoch 100</th>
+              <th>Epoch 400</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Linear probe</td>
+              <td>—</td>
+              <td>—</td>
+            </tr>
+            <tr>
+              <td>MLP probe</td>
+              <td>—</td>
+              <td>—</td>
+            </tr>
+            <tr>
+              <td>Last-block FT</td>
+              <td>—</td>
+              <td>—</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <figure class="chart">
+        <div class="bar-row">
+          <span>Linear</span>
+          <div class="track"><div class="fill" style="width: 0%"></div></div>
+          <span>—</span>
+        </div>
+        <div class="bar-row">
+          <span>MLP</span>
+          <div class="track"><div class="fill" style="width: 0%"></div></div>
+          <span>—</span>
+        </div>
+        <div class="bar-row">
+          <span>Last-block</span>
+          <div class="track"><div class="fill" style="width: 0%"></div></div>
+          <span>—</span>
+        </div>
+        <figcaption>Test accuracy by method. Fill in once the probes are done.</figcaption>
+      </figure>
+    </section>
+
+    <section id="learnings">
+      <h2>Learnings</h2>
+      <ol>
+        <li>
+          Seeing MAE try to learn every fine-grained texture in an image <strong> motivates me
+          to pursue JEPA-style SSL approaches that more directly focus on the semantic
+          representations </strong> of an image. Qualitatively, even at epoch 100,
+          MAE has already learned much of the structure of the STL-10images, but spends the
+          remaining 1500 epochs on the laborious task of local pixel-level detail.
+        </li>
+        <li>
+          <b>Pay close attention to how a paper defines its learning rate.</b>
+          MAE reports a “base learning rate,” then applies a scaling rule to get
+          the actual learning rate used during training. In my first implementation,
+          I used the reported base LR directly with the paper’s batch size of 4096,
+          which meant my effective learning rate was actually about 16× smaller than theirs.
+        </li>
+        <li>
+          During fine-tuning the performance increased significantly when I remembered
+          to turn off the masking and provide all of the patches to the classification head.
+        </li>
+      </ol>
+    </section>
+  </div>
+</body>
+</html>
