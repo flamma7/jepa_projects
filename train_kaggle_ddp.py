@@ -1,5 +1,10 @@
 """
-Version 3 adds saving model weights to HuggingFace
+Script to train the MAE model on the STL10 dataset using DDP with 2x GPUs on Kaggle
+- monolithic script for easier deployment to Kaggle'
+- applies patch normalization to output reconstructed patches
+- No Python Lightning, raw pytorch code for practice
+- HuggingFace for model storage 
+- autocast for mixed precision training bc Kaggle's GPUs are old
 """
 import torch
 from torch import nn, optim
