@@ -116,7 +116,7 @@ class Net(nn.Module):
         self.dec_terminal_norm = nn.LayerNorm(d_dec)
         self.dec2img_projection = nn.Linear(d_dec, d_patch)
 
-    def encode(self, x):
+    def encode(self, x, mask=True):
         # x is (B, C, H, W) = (B, 3, 96, 96)
         B, C, H, W = x.shape
 
@@ -134,28 +134,25 @@ class Net(nn.Module):
         # assert x.shape == (B, 144, 192), x.shape
         truth_patches = x
 
-        # Create a mask and apply it
-        noise = torch.rand(B, SEQ, device=x.device)
-        ids_shuffle = torch.argsort(noise, dim=1) # Get a list of sorted ids for each B
-        n_keep = int(SEQ * self.percent_unmasked)
-        ids_unmasked = ids_shuffle[:, :n_keep] # Store the ids of first 25% -> (B, n_keep)
-        ids_masked = ids_shuffle[:, n_keep:] # Store the ids of last 75% -> (B, n_masked)
-
-        # x_unmasked we want (B, n_keep, 192)
-        ind_unmasked_enc = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.d_patch) # (B, n_keep, d_patch)
-        
-        # For dim=1, keep all dimensions the same but replaces with the column index
-        x_unmasked = torch.gather(x, 1, ind_unmasked_enc)
-        # assert x_unmasked.shape == (B, n_keep, 192), x_unmasked.shape
-
-        embeddings = self.img2enc_projection(x_unmasked)
-
-        # Add our positional embeddings
-        # (N_PATCHES, D)
-        # embeddings is (B, n_keep, D)
-        ind_unmasked_pos = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.d_enc)
-        local_pos_embeddings = torch.gather(self.pos_embeddings_enc.unsqueeze(0).expand(B, -1, -1), 1, ind_unmasked_pos)
-        embeddings = embeddings + local_pos_embeddings
+        if mask:
+            noise = torch.rand(B, SEQ, device=x.device)
+            ids_shuffle = torch.argsort(noise, dim=1)
+            n_keep = int(SEQ * self.percent_unmasked)
+            ids_unmasked = ids_shuffle[:, :n_keep]
+            ids_masked = ids_shuffle[:, n_keep:]
+            ind_unmasked_enc = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.d_patch)
+            x_unmasked = torch.gather(x, 1, ind_unmasked_enc)
+            embeddings = self.img2enc_projection(x_unmasked)
+            ind_unmasked_pos = ids_unmasked.unsqueeze(-1).expand(-1, -1, self.d_enc)
+            local_pos_embeddings = torch.gather(
+                self.pos_embeddings_enc.unsqueeze(0).expand(B, -1, -1), 1, ind_unmasked_pos
+            )
+            embeddings = embeddings + local_pos_embeddings
+        else:
+            # Downstream eval / probing: every patch, spatial order.
+            ids_unmasked = torch.arange(SEQ, device=x.device).unsqueeze(0).expand(B, -1)
+            ids_masked = x.new_empty((B, 0), dtype=torch.long)
+            embeddings = self.img2enc_projection(x) + self.pos_embeddings_enc
 
         # Run through all Encoder Blocks
         for block in self.encoder_blocks:
