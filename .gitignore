@@ -8,3 +8,4 @@ checkpoints/
 *.pt
 *.png
 !docs/assets/*.png
+*.npz
