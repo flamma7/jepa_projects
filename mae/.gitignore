@@ -1,7 +1,0 @@
-*.pth
-checkpoints/
-venv/
-data/
-*.png
-__pycache__
-*.pt
