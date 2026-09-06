@@ -39,7 +39,7 @@
         fine-tuning the last transformer block plus a linear head, following the
         paper's ablation.
       </p>
-      <figure>
+      <figure class="figure-half">
         <img src="mae_vit_s8_architecture.svg" alt="MAE architecture with ViT-S/8 encoder and lightweight decoder.">
         <figcaption>
           MAE architecture: 75% random masking, ViT-S/8 encoder on visible patches,
@@ -54,10 +54,15 @@
         Same mask, same four test images, two checkpoints. Early reconstructions get
         layout and hue; later ones pick up texture.
       </p>
-      <p class="todo">Add later checkpoints or a loss curve here if you want a fuller progression.</p>
       <figure>
-        <img src="assets/mae_reconstructions.png" alt="Reconstruction quality improving from epoch 100 to epoch 400.">
-        <figcaption>Rows: original, masked input, recon @100, recon @400.</figcaption>
+        <img src="assets/mae_reconstructions_comparison.png" alt="Reconstruction quality improving from epoch 100, 800, and 1600.">
+        <figcaption>Rows: original, masked input, recon @100, recon @800, recon @1600.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/loss_curve.png" alt="Learning rate schedule and reconstruction loss over 1600 training epochs.">
+        <figcaption>
+          Learning rate (warmup then cosine decay) and reconstruction loss over 1600 epochs.
+        </figcaption>
       </figure>
     </section>
 

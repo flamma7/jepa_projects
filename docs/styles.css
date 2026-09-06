@@ -81,6 +81,11 @@ figure img {
   height: auto;
 }
 
+figure.figure-half img {
+  width: 50%;
+  margin: 0 auto;
+}
+
 figcaption {
   margin-top: 0.45rem;
   font-size: 0.9rem;
