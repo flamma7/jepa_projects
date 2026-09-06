@@ -1,62 +1,36 @@
-# 3 ViT, 1 Decoder no data augmentation
-- SSL 0.259
-- bug with positional embeddings BEFORE projection into D
+# Masked Autoencoders on STL-10
 
-# 3 ViT, 1 Decoder mae_pretrain_aug_0.208_192, 200 epochs
-- SSL 0.208 training loss
-- same as above but with data agumentation (random cropping and flip)
+From-scratch MAE in raw PyTorch (no Lightning), trained on STL-10 for self-supervised visual representations.
 
-# 6 ViT Encoder Blocks, 1 Decoder, D=384, Batch=256, 200 epochs
-- SSL training loss of 0.19122
-- linear probe accuracy of 0.6326
+[Project page](https://flamma7.github.io/mae-stl10/) · [Model weights](https://huggingface.co/flamma77/mae/tree/main/ViT-S-runpod)
 
-# 8 ViT Encoder Blocks, 2 Decoder, D=384, Batch=256, 200 epochs
-- SSL training loss of 0.1848
-- linear probe accuracy of 0.6787
-- D=384, D=384 AND 3 heads
+![Original, masked input, and image reconstructions of STL-10 test images.](./docs/assets/mae_reconstructions.png)
 
-# ViT-B/8, 8 Decoder, 400 epochs, Autocast, Gradient Checkpointing
-- SSL training loss of 0.1782, 0.177 (see latest checkpoint at 160)
+## Approach
 
-# ViT-S/8, 12e, 4d, 400 epochs, no autocast, gradient checkpointing
+- **Model.** ViT-S encoder and an 8-layer decoder, trained with the MAE recipe (75% of patches masked).
+- **Data.** STL-10: 100k unlabeled images for pretraining, 5k labeled for fine-tuning, 8k for test.
+- **Training.** 1600 epochs on one RTX 5090 via RunPod. Reported results are from this run. The first implementation used DDP on Kaggle with 2× Tesla T4s.
+- **Evaluation.** Linear probe, MLP probe, and fine-tuning the last transformer block plus a linear head (paper ablation).
 
-NEXT:
-- X Fine-tune the linear probe on 8e_2d & visualize & Record!
-- X try torch.autocast to float16 + grad checkpointing and train ViT-Base
-- X train ViT-Base and see how well we do
-- X train ViT-Small (100k may be too small for ViT-Base) & bump BatchSize
+Reconstruction quality largely plateaus after the first few hundred epochs — 100k images vs. the MAE paper’s 1.28M ImageNet-1K, plus a ViT-S encoder. Representation quality kept improving anyway, as in the paper.
 
-THIS IS SUPER COOL! FOR LINEAR PROBING
-- precompute encoder's output for ALL DATA POINTS THEN FIT cyanure (convex optimization)-
--> No learning rate, just pops out the optimal convex solution fitted via logistic regression!
+## Repo layout
 
-- linear probe VIT-Small (w/ BatchNorm no affine)
-- train ResNet tiny fully supervised on STL10 (no unsupervised dataset) & compare?
-- train a Vit-Tiny fully supervised on STL10 & compare?
-- try fine-tuning the entire networks ViT-Small 
-- train a ViT-Tiny model to compare
+```
+model.py              # MAE: ViT-S encoder + lightweight decoder
+train_runpod.ipynb    # 5090 training on RunPod (source of reported results)
+train_kaggle_ddp.py   # first implementation: Kaggle DDP on 2× GPUs
+finetune.ipynb        # linear / MLP / last-block probes
+finetune.py           # scripted version of finetune.ipynb
+visualize.ipynb       # reconstruction grids across checkpoints
+docs/                 # project page
+```
 
-- Create a short report on my ablation studies
-- Create a list of tricks section of the report for myself
-- Dive into the hyperparameters: AdamW, linear probe training too
+There are two training scripts. Use `train_runpod.ipynb` for the 5090 setup; `train_kaggle_ddp.py` is the earlier DDP version.
 
-INTERESTING:
-- They apply random resize crops+horizontal flips augmentation during linear probe evaluations!
-- 
+## Learnings
 
-The learning rate I use is right out of the DINO paper
-- AdamW
-- 10 epochs to linearly ramp up the LR
-- Cosine schedule after that
-- weight decay 0.04 to 0.4
-
-
-THINGS TO TRY
-1. Try with appropriate nubmer of heads for decoder
-2. Try decoder dim=256, 4 heads, depth 4
-3. Try with correct embeddings normalization
-
-Ok possibly something wrong is the decoder had too many heads which may have screwed up learning
-I could also try 
-
-- smaller batch size SO that I don't need gradient checkpoint and it trains faster
+- MAE spends most of training on local pixel detail once structure is in place, which is why JEPA-style SSL is appealing.
+- MAE’s reported “base” learning rate is scaled by batch size. Using the base LR at batch 4096 made the effective LR about 16× too small.
+- Turn masking off at fine-tune time and pass all patches to the classification head.
