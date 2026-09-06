@@ -23,6 +23,8 @@ MODEL_DIR = "checkpoints"
 CHECKPOINTS = [
     "checkpoint_epoch_100.pt",
     "checkpoint_epoch_400.pt",
+    "checkpoint_epoch_800.pt",
+    "checkpoint_epoch_1600.pt"
 ]
 RESULTS_PATH = "results.npz"
 
@@ -34,7 +36,7 @@ N_CLASSES = 10
 N_EPOCHS = 50
 
 # Linear probe
-LINEAR_LR = 1e-3
+LINEAR_LR = 3e-3
 
 # MLP probe
 MLP_LR = 1e-3
@@ -44,7 +46,7 @@ MLP_WEIGHT_DECAY = 1e-4
 MLP_DROPOUT = 0.1
 
 # Last transformer block
-LAST_BLOCK_LR = 3e-4
+LAST_BLOCK_LR = 1e-4
 LAST_BLOCK_WARMUP_EPOCHS = 5
 LAST_BLOCK_WEIGHT_DECAY = 0.05
 

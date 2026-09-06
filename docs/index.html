@@ -24,21 +24,32 @@
 
     <figure>
       <img src="assets/mae_reconstructions.png" alt="MAE reconstructions: original images, masked inputs, and reconstructions at various epochs.">
-      <figcaption><strong>Original, masked input, and reconstructions at various epochs.</strong> The significant color differences in some patches (like the blue patches on the dog's ear or the pink patches on the deer) are the result of using per-patch normalized pixels as the reconstruction target. This removes each patch's absolute mean and scale during training; during visualization, the true mean and scale are reapplied to the prediction. This process encourages local structure/texture, but errors in the normalized precition can appear as reconstruction artifacts.</figcaption>
+      <figcaption>Original, masked input, and image reconstructions of STL-10 test images.</figcaption>
 
     </figure>
 
     <section id="approach">
       <h2>Approach</h2>
-      <p>
-        Implemented a ViT-S encoder and 8-layer ViT decoder using the MAE training
-        recipe (75% of patches masked, 25% visible). STL-10 consists of 100k unlabeled
-        images (used for SSL pretraining), 5k labeled images for supervised
-        fine-tuning, and 8k test images. I trained the MAE on one RTX 5090 for 1600
-        epochs, then evaluated with a linear classification head, an MLP head, and
-        fine-tuning the last transformer block plus a linear head, following the
-        paper's ablation.
-      </p>
+      <ul>
+        <li>
+          <strong>Model.</strong> ViT-S encoder and an 8-layer decoder, trained with
+          the MAE recipe (75% of patches masked, 25% visible).
+        </li>
+        <li>
+          <strong>Data.</strong> STL-10: 100k unlabeled images for pretraining,
+          5k labeled for fine-tuning, and 8k for test.
+        </li>
+        <li>
+          <strong>Implementation.</strong> From scratch in raw PyTorch (w/o Lightning).
+        </li>
+        <li>
+          <strong>Training.</strong> 1600 epochs on one RTX 5090 via RunPod. First implementation was DDP with 2x Tesla T4s. 
+        </li>
+        <li>
+          <strong>Evaluation.</strong> Linear probe, MLP probe, and fine-tuning the
+          last transformer block plus a linear head, following the paper’s ablation.
+        </li>
+      </ul>
       <figure class="figure-half">
         <img src="mae_vit_s8_architecture.svg" alt="MAE architecture with ViT-S/8 encoder and lightweight decoder.">
         <figcaption>
@@ -49,14 +60,22 @@
     </section>
 
     <section id="reconstruct">
-      <h2>Learning to reconstruct</h2>
+      <h2>Generative Reconstructions</h2>
       <p>
-        Same mask, same four test images, two checkpoints. Early reconstructions get
-        layout and hue; later ones pick up texture.
+        Reconstructions can be seen below at various training epochs.
+        Reconstruction quality largely plateaus after the first few hundred
+        training epochs, likely due to several factors including the limited
+        size of the training set (100k vs. the MAE paper’s 1.28M ImageNet-1K
+        images) and the limited capacity of the encoder, ViT-S. I did not elect
+        to test a larger encoder because of the relatively small size of the
+        training set. As seen in the next section, representation quality
+        continued to improve even if reconstruction quality plateaued, which was
+        also observed in the paper.
       </p>
+      <p>The significant color differences in some patches (like the blue patches on the dog's ear or the pink patches on the deer) are the result of using per-patch normalized pixels as the reconstruction target. This removes each patch's absolute mean and scale during training and, during visualization, reapplies these ground truth statistics to the predicted patch. This process emphasizes local structure/texture, but errors in the normalized precition sometimes appear as conspicuous reconstruction artifacts.</p>
       <figure>
         <img src="assets/mae_reconstructions_comparison.png" alt="Reconstruction quality improving from epoch 100, 800, and 1600.">
-        <figcaption>Rows: original, masked input, recon @100, recon @800, recon @1600.</figcaption>
+        <figcaption>Original image, masked input and reconstructed images at Epochs 100, 800 and 1600.</figcaption>
       </figure>
       <figure>
         <img src="assets/loss_curve.png" alt="Learning rate schedule and reconstruction loss over 1600 training epochs.">
@@ -134,7 +153,7 @@
           MAE reports a “base learning rate,” then applies a scaling rule to get
           the actual learning rate used during training. In my first implementation,
           I used the reported base LR directly with the paper’s batch size of 4096,
-          which meant my effective learning rate was actually about 16× smaller than theirs.
+          which meant my effective learning rate was erroneously actually about 16× smaller than theirs.
         </li>
         <li>
           During fine-tuning the performance increased significantly when I remembered
